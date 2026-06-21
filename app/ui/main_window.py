@@ -1,0 +1,498 @@
+"""主窗口：无边框 + 蓝色标题栏 + 左侧导航（矢量图标）+ 内容区 + 状态栏。"""
+import sys
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QLabel,
+    QPushButton,
+    QStackedWidget,
+    QButtonGroup,
+    QFrame,
+    QMessageBox,
+)
+from PySide6.QtCore import Qt, QPoint, QSize, QEvent, QThread, Signal
+from PySide6.QtGui import QMouseEvent
+
+from app.config import APP_TITLE, APP_VERSION
+from app import db
+from app import updater
+from app.ui.icons import make_icon, make_pixmap
+from app.ui.pages.home import HomePage
+from app.ui.pages.auto_sync import AutoSyncPage
+from app.ui.pages.batch_rename import BatchRenamePage
+from app.ui.pages.ad_insert import AdInsertPage
+from app.ui.pages.settings import SettingsPage
+from app.ui.pages.logs import LogsPage
+from app.ui.pages.placeholder import PlaceholderPage
+
+PRIMARY = "#2f6bff"
+PRIMARY_DARK = "#1f54e0"
+GRAY = "#5b6473"
+
+NAV = [
+    ("home", "主页", "home"),
+    ("auto", "自动转存", "sync"),
+    ("rename", "批量重命名", "edit"),
+    ("ad", "广告插入", "target"),
+    ("friends", "好友消息", "users"),
+    ("logs", "转存记录", "logs"),
+    ("settings", "设置", "settings"),
+]
+
+
+class TitleBar(QWidget):
+    def __init__(self, window: "MainWindow"):
+        super().__init__()
+        self.window_ref = window
+        self.setObjectName("TitleBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        self.setStyleSheet(
+            "QWidget#TitleBar {"
+            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {PRIMARY}, stop:1 {PRIMARY_DARK});"
+            "}"
+            "QLabel#TitleText { color: white; font-size: 13.5px; font-weight: 600; }"
+            "QPushButton#WinBtn, QPushButton#WinBtnClose {"
+            "background: transparent; color: rgba(255,255,255,0.92); border: none;"
+            "font-size: 14px; min-width: 44px; min-height: 36px; font-weight: 600;"
+            "}"
+            "QPushButton#WinBtn:hover { background: rgba(255,255,255,0.20); color: white; }"
+            "QPushButton#WinBtnClose:hover { background: #e5484d; color: white; }"
+        )
+        self.setFixedHeight(36)
+        self._drag_pos: QPoint | None = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 0, 0, 0)
+        lay.setSpacing(7)
+        logo = QLabel()
+        logo.setPixmap(make_pixmap("cloud", "#ffffff", 17))
+        lay.addWidget(logo)
+        title = QLabel(APP_TITLE)
+        title.setObjectName("TitleText")
+        lay.addWidget(title)
+        lay.addStretch()
+
+        self.min_btn = QPushButton("−")
+        self.min_btn.setObjectName("WinBtn")
+        self.min_btn.setToolTip("最小化")
+        self.min_btn.clicked.connect(window.showMinimized)
+        self.max_btn = QPushButton("□")
+        self.max_btn.setObjectName("WinBtn")
+        self.max_btn.setToolTip("最大化")
+        self.max_btn.clicked.connect(self._toggle_max_restore)
+        self.close_btn = QPushButton("×")
+        self.close_btn.setObjectName("WinBtnClose")
+        self.close_btn.setToolTip("关闭")
+        self.close_btn.clicked.connect(window.close)
+        lay.addWidget(self.min_btn)
+        lay.addWidget(self.max_btn)
+        lay.addWidget(self.close_btn)
+
+    def mousePressEvent(self, e: QMouseEvent):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = (
+                e.globalPosition().toPoint()
+                - self.window_ref.frameGeometry().topLeft()
+            )
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        if self._drag_pos and e.buttons() & Qt.LeftButton:
+            self.window_ref.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e: QMouseEvent):
+        self._drag_pos = None
+
+    def mouseDoubleClickEvent(self, e: QMouseEvent):
+        if e.button() == Qt.LeftButton:
+            self._toggle_max_restore()
+
+    def _toggle_max_restore(self):
+        if self.window_ref.isMaximized():
+            self.window_ref.showNormal()
+        else:
+            self.window_ref.showMaximized()
+        self.refresh_state()
+
+    def refresh_state(self):
+        maximized = self.window_ref.isMaximized()
+        self.max_btn.setText("❐" if maximized else "□")
+        self.max_btn.setToolTip("还原" if maximized else "最大化")
+
+
+class NavButton(QPushButton):
+    def __init__(self, icon_name: str, text: str):
+        super().__init__("  " + text)
+        self.icon_name = icon_name
+        self.setObjectName("NavItem")
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(19, 19))
+        self._update_icon(False)
+        self.toggled.connect(self._update_icon)
+
+    def _update_icon(self, checked: bool):
+        self.setIcon(make_icon(self.icon_name, PRIMARY if checked else GRAY, 19))
+
+
+class AccountChip(QFrame):
+    def __init__(self, on_click):
+        super().__init__()
+        self.setObjectName("AccountChip")
+        self.setCursor(Qt.PointingHandCursor)
+        self._on_click = on_click
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(9, 7, 9, 7)
+        lay.setSpacing(8)
+        self.avatar = QLabel()
+        self.avatar.setPixmap(make_pixmap("user", "#9aa4b5", 18))
+        lay.addWidget(self.avatar)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.name = QLabel("未登录")
+        self.name.setStyleSheet("font-weight:600; font-size:13px;")
+        self.sub = QLabel("点击添加账号")
+        self.sub.setObjectName("Muted")
+        self.sub.setStyleSheet("font-size:11.5px;")
+        col.addWidget(self.name)
+        col.addWidget(self.sub)
+        lay.addLayout(col)
+        lay.addStretch()
+        self.count = QLabel("")
+        self.count.setObjectName("MemberBadge")
+        lay.addWidget(self.count)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._on_click()
+
+    def refresh(self):
+        acc = db.get_active_account()
+        n = db.account_count()
+        if acc and acc.get("username"):
+            self.name.setText(acc["username"])
+            self.sub.setText("当前账号 · 点击管理")
+            self.avatar.setPixmap(make_pixmap("user", "#2f6bff", 18))
+        else:
+            self.name.setText("未登录")
+            self.sub.setText("点击添加账号")
+            self.avatar.setPixmap(make_pixmap("user", "#9aa4b5", 18))
+        self.count.setText(f"{n} 个账号" if n else "")
+        self.count.setVisible(n > 1)
+
+
+class Sidebar(QWidget):
+    def __init__(self, on_nav):
+        super().__init__()
+        self.setObjectName("Sidebar")
+        self.setFixedWidth(188)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(16, 12, 14, 10)
+        brand_row.setSpacing(7)
+        logo = QLabel()
+        logo.setPixmap(make_pixmap("cloud", PRIMARY, 22))
+        brand_row.addWidget(logo)
+        brand = QLabel("Pan-Auto")
+        brand.setObjectName("Brand")
+        brand_row.addWidget(brand)
+        brand_row.addStretch()
+        lay.addLayout(brand_row)
+
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons: dict[str, QPushButton] = {}
+        for key, text, icon in NAV:
+            btn = NavButton(icon, text)
+            btn.clicked.connect(lambda _=False, k=key: on_nav(k))
+            self.group.addButton(btn)
+            self.buttons[key] = btn
+            lay.addWidget(btn)
+
+        lay.addStretch()
+
+        box = QWidget()
+        box.setObjectName("AccountBox")
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(10, 9, 10, 10)
+        self.chip = AccountChip(lambda: on_nav("settings"))
+        bl.addWidget(self.chip)
+        lay.addWidget(box)
+
+    def refresh_account(self):
+        self.chip.refresh()
+
+
+class UpdateCheckWorker(QThread):
+    done = Signal(dict)
+
+    def run(self):
+        self.done.emit(updater.check_for_update())
+
+
+class UpdateApplyWorker(QThread):
+    done = Signal(dict)
+
+    def run(self):
+        self.done.emit(updater.apply_update())
+
+
+class StatusBar(QWidget):
+    def __init__(self, on_check_update):
+        super().__init__()
+        self.setObjectName("StatusBar")
+        self.setFixedHeight(30)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 0, 12, 0)
+        info = QLabel("个人使用 · 请遵守网盘服务条款，注意转存节流")
+        info.setObjectName("Muted")
+        lay.addWidget(info)
+        lay.addStretch()
+        update = QPushButton("检查更新")
+        update.setObjectName("StatusAction")
+        update.setCursor(Qt.PointingHandCursor)
+        update.clicked.connect(on_check_update)
+        lay.addWidget(update)
+        ver = QLabel(f"版本 {APP_VERSION}")
+        ver.setObjectName("Badge")
+        lay.addWidget(ver)
+
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("Root")
+        self.setWindowFlag(Qt.FramelessWindowHint)
+        self.resize(1120, 740)
+        self.setMinimumSize(940, 620)
+        self._update_workers = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.titlebar = TitleBar(self)
+        outer.addWidget(self.titlebar)
+
+        mid = QHBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(0)
+        outer.addLayout(mid, 1)
+
+        self.sidebar = Sidebar(self.navigate)
+        mid.addWidget(self.sidebar)
+
+        self.stack = QStackedWidget()
+        mid.addWidget(self.stack, 1)
+
+        outer.addWidget(StatusBar(self.check_for_updates_manual))
+
+        self.home = HomePage()
+        self.home.navigate.connect(self.navigate)
+        self.auto = AutoSyncPage()
+        self.rename = BatchRenamePage()
+        self.ad_insert = AdInsertPage()
+        self.friends = PlaceholderPage(
+            "好友消息", "自动转存好友聊天发来的文件夹（开发中）"
+        )
+        self.logs = LogsPage()
+        self.settings = SettingsPage()
+        self.settings.account_changed.connect(self.on_account_changed)
+
+        self.pages = {
+            "home": self.home,
+            "auto": self.auto,
+            "rename": self.rename,
+            "ad": self.ad_insert,
+            "friends": self.friends,
+            "logs": self.logs,
+            "settings": self.settings,
+        }
+        for w in self.pages.values():
+            self.stack.addWidget(w)
+
+        self.navigate("home")
+        self.sidebar.refresh_account()
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.WindowStateChange and hasattr(self, "titlebar"):
+            self.titlebar.refresh_state()
+
+    def check_updates_on_startup(self):
+        self._check_for_updates(manual=False)
+
+    def check_for_updates_manual(self):
+        self._check_for_updates(manual=True)
+
+    def _check_for_updates(self, manual: bool):
+        if any(isinstance(w, UpdateCheckWorker) for w in self._update_workers):
+            if manual:
+                QMessageBox.information(self, "更新检查", "正在检查更新，请稍等。")
+            return
+        worker = UpdateCheckWorker()
+        worker.done.connect(lambda result, m=manual: self._on_update_checked(result, m))
+        worker.finished.connect(lambda w=worker: self._update_workers.remove(w))
+        self._update_workers.append(worker)
+        worker.start()
+
+    def _on_update_checked(self, result: dict, manual: bool):
+        if not result.get("ok"):
+            if manual and result.get("code") not in {"not_git", "disabled"}:
+                QMessageBox.warning(self, "更新检查失败", result.get("message", "未知错误"))
+            elif manual:
+                QMessageBox.information(self, "更新检查", result.get("message", "当前版本不可在线更新"))
+            return
+
+        if not result.get("has_update"):
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "更新检查",
+                    f"已是最新版本。\n当前分支：{result.get('branch', '-')}\n当前提交：{result.get('local_sha', '-')}",
+                )
+            return
+
+        msg = (
+            f"发现 {result.get('behind', 0)} 个远程更新。\n"
+            f"分支：{result.get('branch', '-')}\n"
+            f"本地：{result.get('local_sha', '-')}\n"
+            f"远程：{result.get('remote_sha', '-')}\n\n"
+            "现在更新并重启软件吗？"
+        )
+        if QMessageBox.question(self, "发现新版本", msg) == QMessageBox.Yes:
+            self._apply_update()
+
+    def _apply_update(self):
+        if any(isinstance(w, UpdateApplyWorker) for w in self._update_workers):
+            return
+        worker = UpdateApplyWorker()
+        worker.done.connect(self._on_update_applied)
+        worker.finished.connect(lambda w=worker: self._update_workers.remove(w))
+        self._update_workers.append(worker)
+        worker.start()
+
+    def _on_update_applied(self, result: dict):
+        if not result.get("ok"):
+            QMessageBox.warning(self, "更新失败", result.get("message", "未知错误"))
+            return
+        if not result.get("updated"):
+            QMessageBox.information(self, "更新检查", result.get("message", "已是最新版本"))
+            return
+        if (
+            QMessageBox.information(
+                self,
+                "更新完成",
+                "更新已完成，软件将重启以加载新版本。",
+            )
+            == QMessageBox.Ok
+        ):
+            ok, msg = updater.restart_app()
+            if ok:
+                QApplication.quit()
+            else:
+                QMessageBox.warning(self, "重启失败", msg)
+
+    def navigate(self, key: str):
+        if key not in self.pages:
+            return
+        self.stack.setCurrentWidget(self.pages[key])
+        if key in self.sidebar.buttons:
+            self.sidebar.buttons[key].setChecked(True)
+        if key == "logs":
+            self.logs.reload()
+        if key == "auto":
+            self.auto.on_shown()
+        if key == "rename":
+            self.rename.on_shown()
+        if key == "ad":
+            self.ad_insert.on_shown()
+        if key == "settings":
+            self.settings.refresh_accounts()
+
+    def on_account_changed(self):
+        self.sidebar.refresh_account()
+        self.auto.refresh_accounts()
+        self.rename.refresh_accounts()
+        self.ad_insert.refresh_accounts()
+
+    # ---- 无边框窗口的原生边缘缩放（Windows）----
+    RESIZE_MARGIN = 7
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not getattr(self, "_resize_enabled", False):
+            self._resize_enabled = True
+            self._enable_win_resize()
+
+    def _enable_win_resize(self):
+        """把可缩放边框样式加回无边框窗口（标准 Windows 方案）。"""
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        hwnd = int(self.winId())
+        user32 = ctypes.windll.user32
+        GWL_STYLE = -16
+        WS_THICKFRAME = 0x00040000
+        WS_CAPTION = 0x00C00000
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_MINIMIZEBOX = 0x00020000
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        user32.SetWindowLongW(
+            hwnd,
+            GWL_STYLE,
+            (style & ~WS_CAPTION) | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX,
+        )
+        # 触发边框重算
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32" and eventType == b"windows_generic_MSG":
+            import ctypes
+            from ctypes import wintypes
+
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0083:  # WM_NCCALCSIZE：去掉非客户区，内容铺满
+                if msg.wParam:
+                    return True, 0
+            elif msg.message == 0x0084:  # WM_NCHITTEST：边缘返回缩放码
+                lp = msg.lParam & 0xFFFFFFFF
+                x = lp & 0xFFFF
+                y = (lp >> 16) & 0xFFFF
+                if x >= 0x8000:
+                    x -= 0x10000
+                if y >= 0x8000:
+                    y -= 0x10000
+                # 用物理像素的窗口矩形做命中判断，避免 DPI 缩放错位
+                rect = wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(msg.hWnd, ctypes.byref(rect))
+                m = max(5, int(self.RESIZE_MARGIN * self.devicePixelRatioF()))
+                left = 0 <= (x - rect.left) < m
+                right = 0 <= (rect.right - x) < m
+                top = 0 <= (y - rect.top) < m
+                bottom = 0 <= (rect.bottom - y) < m
+                if top and left:
+                    return True, 13
+                if top and right:
+                    return True, 14
+                if bottom and left:
+                    return True, 16
+                if bottom and right:
+                    return True, 17
+                if left:
+                    return True, 10
+                if right:
+                    return True, 11
+                if top:
+                    return True, 12
+                if bottom:
+                    return True, 15
+                return True, 1  # HTCLIENT：其余区域正常交给控件
+        return super().nativeEvent(eventType, message)

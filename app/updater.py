@@ -1,20 +1,33 @@
-"""Git-based self updater.
+"""Self updater.
 
-For source deployments, Pan-Auto can update itself by fetching the configured
-Git remote, fast-forwarding the current branch, and restarting the process.
-Private GitHub repositories should be authenticated by Git Credential Manager
-or another user-level Git credential helper, not by storing tokens in this app.
+Source deployments update through Git. Frozen Windows release builds update by
+downloading the latest GitHub Release zip, starting an external updater script,
+and quitting so files can be replaced safely.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
+from app.config import APP_NAME, APP_VERSION, DATA_DIR
 
-ROOT = Path(__file__).resolve().parents[1]
+
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[1]
+
 REMOTE = os.environ.get("PAN_AUTO_UPDATE_REMOTE", "origin")
+GITHUB_REPO = os.environ.get("PAN_AUTO_GITHUB_REPO", "loadingkuu/Pan-Auto")
+GITHUB_TOKEN_ENV = "PAN_AUTO_GITHUB_TOKEN"
+ASSET_PATTERN = re.compile(r"Pan-Auto-.*windows-x64\.zip$", re.IGNORECASE)
 
 
 def _run_git(args: list[str], timeout: int = 60) -> tuple[bool, str]:
@@ -27,6 +40,8 @@ def _run_git(args: list[str], timeout: int = 60) -> tuple[bool, str]:
             cwd=str(ROOT),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=flags,
         )
@@ -39,6 +54,112 @@ def _run_git(args: list[str], timeout: int = 60) -> tuple[bool, str]:
     return p.returncode == 0, out or err
 
 
+def _run_gh(args: list[str], timeout: int = 90) -> tuple[bool, str]:
+    flags = 0
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        p = subprocess.run(
+            ["gh", *args],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=flags,
+        )
+    except FileNotFoundError:
+        return False, "未找到 GitHub CLI，请安装 gh 或设置 PAN_AUTO_GITHUB_TOKEN"
+    except subprocess.TimeoutExpired:
+        return False, "GitHub 请求超时，请检查网络"
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    return p.returncode == 0, out or err
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    nums = re.findall(r"\d+", version or "")
+    return tuple(int(x) for x in nums) if nums else (0,)
+
+
+def _is_newer(remote: str, current: str) -> bool:
+    return _version_tuple(remote) > _version_tuple(current)
+
+
+def _parse_policy(body: str) -> dict:
+    policy: dict[str, str] = {}
+    for line in (body or "").splitlines():
+        line = line.strip().strip("`")
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().upper()
+        value = value.strip()
+        if key.startswith("PAN_AUTO_"):
+            policy[key] = value
+    return policy
+
+
+def _asset_from_release(release: dict) -> dict | None:
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        if ASSET_PATTERN.search(name):
+            return asset
+    return None
+
+
+def _latest_release_via_gh() -> tuple[bool, dict | str]:
+    ok, out = _run_gh(
+        [
+            "release",
+            "view",
+            "--repo",
+            GITHUB_REPO,
+            "--json",
+            "tagName,name,body,url,assets,isDraft,isPrerelease,publishedAt",
+        ]
+    )
+    if not ok:
+        return False, out
+    try:
+        return True, json.loads(out)
+    except json.JSONDecodeError as e:
+        return False, f"解析 GitHub Release 信息失败：{e}"
+
+
+def _github_headers() -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _latest_release_via_api() -> tuple[bool, dict | str]:
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers=_github_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return True, json.loads(r.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return False, f"读取 GitHub Release 失败：{e}"
+
+
+def _latest_release() -> tuple[bool, dict | str, str]:
+    ok, data = _latest_release_via_gh()
+    if ok:
+        return True, data, "gh"
+    gh_msg = str(data)
+    ok, data = _latest_release_via_api()
+    if ok:
+        return True, data, "api"
+    return False, f"{gh_msg}\n{data}", ""
+
+
 def is_git_repo() -> bool:
     ok, out = _run_git(["rev-parse", "--is-inside-work-tree"], timeout=10)
     return ok and out.strip().lower() == "true"
@@ -48,8 +169,15 @@ def check_for_update() -> dict:
     """Return update state without changing local files."""
     if os.environ.get("PAN_AUTO_DISABLE_UPDATE") == "1":
         return {"ok": False, "code": "disabled", "message": "已禁用更新检查"}
+    if getattr(sys, "frozen", False) or not is_git_repo():
+        return check_release_update()
+    return check_git_update()
+
+
+def check_git_update() -> dict:
+    """Check source deployment updates through Git."""
     if not is_git_repo():
-        return {"ok": False, "code": "not_git", "message": "当前目录不是 Git 仓库"}
+        return {"ok": False, "kind": "git", "code": "not_git", "message": "当前目录不是 Git 仓库"}
 
     ok, branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], timeout=10)
     if not ok or branch == "HEAD":
@@ -59,6 +187,7 @@ def check_for_update() -> dict:
     if not ok:
         return {
             "ok": False,
+            "kind": "git",
             "code": "no_remote",
             "message": f"未配置远程仓库 {REMOTE}",
         }
@@ -67,6 +196,7 @@ def check_for_update() -> dict:
     if not ok:
         return {
             "ok": False,
+            "kind": "git",
             "code": "fetch_failed",
             "message": fetch_msg or "拉取远程更新失败",
             "remote_url": remote_url,
@@ -74,13 +204,14 @@ def check_for_update() -> dict:
 
     ok, local_sha = _run_git(["rev-parse", "HEAD"], timeout=10)
     if not ok:
-        return {"ok": False, "code": "bad_head", "message": local_sha}
+        return {"ok": False, "kind": "git", "code": "bad_head", "message": local_sha}
 
     upstream = f"{REMOTE}/{branch}"
     ok, remote_sha = _run_git(["rev-parse", upstream], timeout=10)
     if not ok:
         return {
             "ok": False,
+            "kind": "git",
             "code": "bad_upstream",
             "message": f"远程分支不存在：{upstream}",
             "branch": branch,
@@ -89,13 +220,14 @@ def check_for_update() -> dict:
 
     ok, counts = _run_git(["rev-list", "--left-right", "--count", f"HEAD...{upstream}"], timeout=10)
     if not ok:
-        return {"ok": False, "code": "compare_failed", "message": counts}
+        return {"ok": False, "kind": "git", "code": "compare_failed", "message": counts}
     parts = counts.split()
     ahead = int(parts[0]) if parts else 0
     behind = int(parts[1]) if len(parts) > 1 else 0
 
     return {
         "ok": True,
+        "kind": "git",
         "code": "ok",
         "has_update": behind > 0,
         "ahead": ahead,
@@ -109,7 +241,65 @@ def check_for_update() -> dict:
     }
 
 
+def check_release_update() -> dict:
+    """Check frozen release updates through GitHub Releases."""
+    ok, release_or_msg, source = _latest_release()
+    if not ok:
+        return {
+            "ok": False,
+            "kind": "release",
+            "code": "release_check_failed",
+            "message": str(release_or_msg),
+        }
+
+    release = release_or_msg
+    tag = release.get("tagName") or release.get("tag_name") or ""
+    latest_version = tag.upper().replace("V", "V", 1)
+    asset = _asset_from_release(release)
+    body = release.get("body", "") or ""
+    policy = _parse_policy(body)
+    force_below = policy.get("PAN_AUTO_FORCE_BELOW") or policy.get("PAN_AUTO_MIN_SUPPORTED")
+    force_update = bool(force_below and _version_tuple(APP_VERSION) < _version_tuple(force_below))
+    has_update = _is_newer(latest_version, APP_VERSION)
+
+    if not asset and has_update:
+        return {
+            "ok": False,
+            "kind": "release",
+            "code": "asset_missing",
+            "message": "发现新版本，但 Release 中没有 Windows x64 运行包",
+            "release_url": release.get("url", ""),
+        }
+
+    return {
+        "ok": True,
+        "kind": "release",
+        "code": "ok",
+        "has_update": has_update,
+        "force_update": force_update,
+        "force_below": force_below or "",
+        "current_version": APP_VERSION,
+        "latest_version": latest_version,
+        "tag_name": tag,
+        "release_name": release.get("name", tag),
+        "release_url": release.get("url", ""),
+        "asset_name": asset.get("name", "") if asset else "",
+        "asset_size": asset.get("size", 0) if asset else 0,
+        "asset_url": asset.get("url") or asset.get("apiUrl", "") if asset else "",
+        "browser_download_url": asset.get("browser_download_url", "") if asset else "",
+        "source": source,
+        "message": "发现新版本" if has_update else "已是最新版本",
+    }
+
+
 def apply_update() -> dict:
+    """Apply update for the current deployment type."""
+    if getattr(sys, "frozen", False) or not is_git_repo():
+        return apply_release_update()
+    return apply_git_update()
+
+
+def apply_git_update() -> dict:
     """Fast-forward current branch from configured remote."""
     state = check_for_update()
     if not state.get("ok"):
@@ -128,6 +318,162 @@ def apply_update() -> dict:
     if not ok:
         return {**state, "ok": False, "code": "pull_failed", "message": msg}
     return {**state, "updated": True, "message": msg or "更新完成"}
+
+
+def apply_release_update() -> dict:
+    """Download latest release zip and launch the external replacement script."""
+    state = check_release_update()
+    if not state.get("ok"):
+        return state
+    if not state.get("has_update"):
+        return {**state, "updated": False, "message": "已是最新版本"}
+    if sys.platform != "win32":
+        return {**state, "ok": False, "code": "unsupported_platform", "message": "打包版自动替换目前仅支持 Windows"}
+
+    ok, zip_path_or_msg = download_release_asset(state)
+    if not ok:
+        return {**state, "ok": False, "code": "download_failed", "message": zip_path_or_msg}
+
+    ok, msg = launch_windows_replacer(Path(zip_path_or_msg))
+    if not ok:
+        return {**state, "ok": False, "code": "replace_failed", "message": msg}
+    return {
+        **state,
+        "updated": True,
+        "restart_managed": True,
+        "downloaded_path": str(zip_path_or_msg),
+        "message": "更新包已下载，关闭软件后将自动替换并重启",
+    }
+
+
+def download_release_asset(state: dict) -> tuple[bool, str]:
+    updates_dir = DATA_DIR / "updates"
+    updates_dir.mkdir(parents=True, exist_ok=True)
+    asset_name = state.get("asset_name") or f"Pan-Auto-{state.get('tag_name', 'latest')}-windows-x64.zip"
+    target = updates_dir / asset_name
+
+    ok, msg = _run_gh(
+        [
+            "release",
+            "download",
+            state["tag_name"],
+            "--repo",
+            GITHUB_REPO,
+            "--pattern",
+            asset_name,
+            "--dir",
+            str(updates_dir),
+            "--clobber",
+        ],
+        timeout=300,
+    )
+    if ok and target.exists():
+        return True, str(target)
+
+    token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
+    if not token:
+        return False, msg or f"下载失败。私有库需要 gh 登录，或设置 {GITHUB_TOKEN_ENV}"
+
+    url = state.get("asset_url") or state.get("browser_download_url")
+    if not url:
+        return False, "Release 资产缺少下载地址"
+    headers = _github_headers()
+    headers["Accept"] = "application/octet-stream"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r, target.open("wb") as f:
+            shutil.copyfileobj(r, f)
+        return True, str(target)
+    except Exception as e:  # noqa: BLE001
+        return False, f"下载 Release 资产失败：{e}"
+
+
+def launch_windows_replacer(zip_path: Path) -> tuple[bool, str]:
+    exe = Path(sys.executable).resolve()
+    install_dir = exe.parent
+    if not exe.exists() or exe.suffix.lower() != ".exe":
+        return False, "当前程序不是可替换的 Windows exe"
+    if not (install_dir / exe.name).exists():
+        return False, "安装目录校验失败"
+    if not (install_dir / "_internal").exists():
+        return False, "未找到 _internal 目录，当前不是标准运行包结构"
+
+    script = DATA_DIR / "updates" / f"apply-update-{int(time.time())}.ps1"
+    script.write_text(_windows_replacer_script(), encoding="utf-8")
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        return False, "未找到 PowerShell，无法自动替换运行包"
+
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-Zip",
+            str(zip_path),
+            "-InstallDir",
+            str(install_dir),
+            "-ExeName",
+            exe.name,
+            "-PidToWait",
+            str(os.getpid()),
+        ],
+        cwd=str(install_dir),
+        close_fds=True,
+        creationflags=flags,
+    )
+    return True, "外部更新器已启动"
+
+
+def _windows_replacer_script() -> str:
+    return r'''
+param(
+    [Parameter(Mandatory=$true)][string]$Zip,
+    [Parameter(Mandatory=$true)][string]$InstallDir,
+    [Parameter(Mandatory=$true)][string]$ExeName,
+    [Parameter(Mandatory=$true)][int]$PidToWait
+)
+
+$ErrorActionPreference = "Stop"
+Wait-Process -Id $PidToWait -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
+
+$marker = Join-Path $InstallDir $ExeName
+if (-not (Test-Path -LiteralPath $marker)) {
+    throw "安装目录校验失败：$marker"
+}
+$internal = Join-Path $InstallDir "_internal"
+if (-not (Test-Path -LiteralPath $internal)) {
+    throw "未找到 _internal 目录，当前不是标准运行包结构"
+}
+
+$workRoot = Join-Path ([IO.Path]::GetDirectoryName($Zip)) ("stage-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+Expand-Archive -LiteralPath $Zip -DestinationPath $workRoot -Force
+
+$source = Join-Path $workRoot "Pan-Auto"
+if (-not (Test-Path -LiteralPath $source)) {
+    $source = $workRoot
+}
+if (-not (Test-Path -LiteralPath (Join-Path $source $ExeName))) {
+    throw "更新包结构不正确，未找到 $ExeName"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $source "_internal"))) {
+    throw "更新包结构不正确，未找到 _internal"
+}
+
+Remove-Item -LiteralPath $marker -Force
+Remove-Item -LiteralPath $internal -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $source $ExeName) -Destination $InstallDir -Force
+Copy-Item -LiteralPath (Join-Path $source "_internal") -Destination $InstallDir -Recurse -Force
+Remove-Item -LiteralPath $workRoot -Recurse -Force
+
+Start-Process -FilePath (Join-Path $InstallDir $ExeName)
+'''
 
 
 def restart_app() -> tuple[bool, str]:

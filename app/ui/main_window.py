@@ -272,6 +272,7 @@ class MainWindow(QWidget):
         self.resize(1120, 740)
         self.setMinimumSize(940, 620)
         self._update_workers = []
+        self._force_update_required = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -352,11 +353,47 @@ class MainWindow(QWidget):
 
         if not result.get("has_update"):
             if manual:
+                if result.get("kind") == "release":
+                    QMessageBox.information(
+                        self,
+                        "更新检查",
+                        f"已是最新版本。\n当前版本：{result.get('current_version', '-')}\n最新版本：{result.get('latest_version', '-')}",
+                    )
+                    return
                 QMessageBox.information(
                     self,
                     "更新检查",
                     f"已是最新版本。\n当前分支：{result.get('branch', '-')}\n当前提交：{result.get('local_sha', '-')}",
                 )
+            return
+
+        if result.get("force_update"):
+            self._force_update_required = True
+            msg = (
+                "当前版本已低于最低支持版本，必须更新后才能继续使用。\n\n"
+                f"当前版本：{result.get('current_version', '-')}\n"
+                f"最低支持：{result.get('force_below', '-')}\n"
+                f"最新版本：{result.get('latest_version', '-')}\n\n"
+                "点击确定开始更新。"
+            )
+            QMessageBox.warning(self, "必须更新", msg)
+            self._apply_update()
+            return
+
+        if result.get("kind") == "release":
+            size = result.get("asset_size", 0) or 0
+            mb = size / 1024 / 1024 if size else 0
+            msg = (
+                "发现新的运行包。\n"
+                f"当前版本：{result.get('current_version', '-')}\n"
+                f"最新版本：{result.get('latest_version', '-')}\n"
+                f"安装包：{result.get('asset_name', '-')}"
+            )
+            if mb:
+                msg += f"\n大小：{mb:.1f} MB"
+            msg += "\n\n现在下载并更新吗？"
+            if QMessageBox.question(self, "发现新版本", msg) == QMessageBox.Yes:
+                self._apply_update()
             return
 
         msg = (
@@ -381,9 +418,19 @@ class MainWindow(QWidget):
     def _on_update_applied(self, result: dict):
         if not result.get("ok"):
             QMessageBox.warning(self, "更新失败", result.get("message", "未知错误"))
+            if self._force_update_required:
+                QApplication.quit()
             return
         if not result.get("updated"):
             QMessageBox.information(self, "更新检查", result.get("message", "已是最新版本"))
+            return
+        if result.get("restart_managed"):
+            QMessageBox.information(
+                self,
+                "更新已准备好",
+                "更新包已下载。点击确定后软件会关闭，外部更新器会替换文件并自动重启。",
+            )
+            QApplication.quit()
             return
         if (
             QMessageBox.information(

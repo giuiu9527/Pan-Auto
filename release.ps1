@@ -29,7 +29,6 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-# 规范化版本号，确保 V 前缀
 if ($Version -notmatch '^[Vv]') { $Version = "V$Version" }
 
 $repo = "loadingkuu/Pan-Auto"
@@ -39,6 +38,22 @@ $zipName = "Pan-Auto-$Version-windows-x64.zip"
 function Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Utf8NoBom($path, $text) {
     [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# 运行原生程序（git/pyinstaller/gh）：这些会往 stderr 写日志，
+# 在 EAP=Stop 下会被当致命错误。这里临时放开、只按退出码判成败。
+function Exec([scriptblock]$block, [string]$errMsg) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $block } finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -ne 0) { throw "$errMsg（退出码 $LASTEXITCODE）" }
+}
+# 运行原生程序但不因退出码抛错，返回退出码（用于探测类命令）
+function TryExec([scriptblock]$block) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $block } finally { $ErrorActionPreference = $prev }
+    return $LASTEXITCODE
 }
 
 # ---- 预检 ----
@@ -62,13 +77,11 @@ if ($updated -ne $content) {
 # ---- 2. 提交并推送 ----
 if (-not $SkipPush) {
     Step "提交并推送到 main"
-    git add -A
-    git diff --cached --quiet
-    if ($LASTEXITCODE -ne 0) {
-        git commit -m "Release $Version"
-        if ($LASTEXITCODE -ne 0) { throw "git commit 失败" }
-        git push origin main
-        if ($LASTEXITCODE -ne 0) { throw "git push 失败" }
+    Exec { git add -A } "git add 失败"
+    $dirty = (TryExec { git diff --cached --quiet }) -ne 0
+    if ($dirty) {
+        Exec { git commit -m "Release $Version" } "git commit 失败"
+        Exec { git push origin main } "git push 失败"
     } else {
         Write-Host "没有需要提交的改动" -ForegroundColor Yellow
     }
@@ -77,8 +90,7 @@ if (-not $SkipPush) {
 # ---- 3. 打包 ----
 if (-not $SkipBuild) {
     Step "PyInstaller 打包（约 2-5 分钟）"
-    & $py -m PyInstaller --noconfirm Pan-Auto.spec
-    if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败" }
+    Exec { & $py -m PyInstaller --noconfirm Pan-Auto.spec } "PyInstaller 打包失败"
 }
 $exe = Join-Path $root "dist\Pan-Auto\Pan-Auto.exe"
 if (-not (Test-Path $exe)) { throw "未找到运行包：$exe（去掉 -SkipBuild 重新打包）" }
@@ -99,18 +111,18 @@ if (-not $SkipRelease) {
         if (Test-Path $notesFile) { $Notes = Get-Content $notesFile -Raw }
         else { $Notes = "Pan-Auto $Version`n`n自动更新：旧版本点「检查更新」即可升级。" }
     }
-    # 同名 Release 已存在则删除重建（含 tag）
-    gh release view $Version --repo $repo 1>$null 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $exists = (TryExec { gh release view $Version --repo $repo 1>$null 2>$null }) -eq 0
+    if ($exists) {
         Write-Host "Release $Version 已存在，删除后重建..." -ForegroundColor Yellow
-        gh release delete $Version --repo $repo --yes --cleanup-tag
+        Exec { gh release delete $Version --repo $repo --yes --cleanup-tag } "删除旧 Release 失败"
     }
     $tmp = New-TemporaryFile
     Write-Utf8NoBom $tmp.FullName $Notes
-    gh release create $Version $zipPath --repo $repo --target main --title "Pan-Auto $Version" --notes-file $tmp.FullName
-    $rc = $LASTEXITCODE
-    Remove-Item $tmp.FullName -Force -ErrorAction SilentlyContinue
-    if ($rc -ne 0) { throw "创建 Release 失败" }
+    try {
+        Exec { gh release create $Version $zipPath --repo $repo --target main --title "Pan-Auto $Version" --notes-file $tmp.FullName } "创建 Release 失败"
+    } finally {
+        Remove-Item $tmp.FullName -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---- 6. 清理 ----

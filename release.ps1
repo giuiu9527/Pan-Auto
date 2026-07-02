@@ -39,6 +39,10 @@ function Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Utf8NoBom($path, $text) {
     [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
+# 必须按 UTF-8 读源码/说明文件；PS5.1 的 Get-Content 默认按 GBK 会把中文读乱、破坏文件
+function Read-Utf8($path) {
+    return [IO.File]::ReadAllText($path, (New-Object System.Text.UTF8Encoding($false)))
+}
 
 # 运行原生程序（git/pyinstaller/gh）：这些会往 stderr 写日志，
 # 在 EAP=Stop 下会被当致命错误。这里临时放开、只按退出码判成败。
@@ -65,7 +69,7 @@ if (-not $SkipRelease -and -not (Get-Command gh -ErrorAction SilentlyContinue)) 
 # ---- 1. 升版本号 ----
 Step "更新版本号 -> $Version"
 $cfg = Join-Path $root "app\config.py"
-$content = Get-Content $cfg -Raw
+$content = Read-Utf8 $cfg
 $updated = [regex]::Replace($content, 'APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$Version`"")
 if ($updated -ne $content) {
     Write-Utf8NoBom $cfg $updated
@@ -108,7 +112,7 @@ if (-not $SkipRelease) {
     Step "创建 GitHub Release $Version"
     if (-not $Notes) {
         $notesFile = Join-Path $root "RELEASE_NOTES.md"
-        if (Test-Path $notesFile) { $Notes = Get-Content $notesFile -Raw }
+        if (Test-Path $notesFile) { $Notes = Read-Utf8 $notesFile }
         else { $Notes = "Pan-Auto $Version`n`n自动更新：旧版本点「检查更新」即可升级。" }
     }
     $exists = (TryExec { gh release view $Version --repo $repo 1>$null 2>$null }) -eq 0

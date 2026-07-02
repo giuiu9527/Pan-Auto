@@ -31,7 +31,8 @@ Set-Location $root
 
 if ($Version -notmatch '^[Vv]') { $Version = "V$Version" }
 
-$repo = "loadingkuu/Pan-Auto"
+# 源码推送到 origin（私有源码库）；Release 传到公开发布库
+$repo = "loadingkuu/Pan-Auto-release"
 $py = ".\.venv\Scripts\python.exe"
 $zipName = "Pan-Auto-$Version-windows-x64.zip"
 

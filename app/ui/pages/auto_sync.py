@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QFrame,
     QStackedWidget,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 
@@ -85,26 +86,30 @@ class AutoSyncPage(QWidget):
         self.form_title.setObjectName("PageTitle")
         left_lay.addWidget(self.form_title)
 
-        # Tab：分享同步 / 群组同步
-        tab_row = QHBoxLayout()
+        # Tab：分享同步 / 群组同步（放进卡片内，见下方 fl）
         self.tab_group = QButtonGroup(self)
         self.share_tab = QPushButton("  分享同步")
         self.share_tab.setObjectName("Tab")
         self.share_tab.setCheckable(True)
         self.share_tab.setChecked(True)
+        self.share_tab.setFixedHeight(36)
+        self.share_tab.setCursor(Qt.PointingHandCursor)
         self.share_tab.setIcon(make_icon("link", "#ffffff", 15))
         self.group_tab = QPushButton("  群组同步")
         self.group_tab.setObjectName("Tab")
         self.group_tab.setCheckable(True)
+        self.group_tab.setFixedHeight(36)
+        self.group_tab.setCursor(Qt.PointingHandCursor)
         self.group_tab.setIcon(make_icon("users", "#5b6473", 15))
         self.tab_group.addButton(self.share_tab)
         self.tab_group.addButton(self.group_tab)
         self.tab_group.setExclusive(True)
         self.share_tab.clicked.connect(lambda: self.set_tab("share"))
         self.group_tab.clicked.connect(lambda: self.set_tab("group"))
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(8)
         tab_row.addWidget(self.share_tab, 1)
         tab_row.addWidget(self.group_tab, 1)
-        left_lay.addLayout(tab_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -120,14 +125,17 @@ class AutoSyncPage(QWidget):
 
         form_card = card()
         fl = QVBoxLayout(form_card)
-        fl.setContentsMargins(18, 16, 18, 16)
+        fl.setContentsMargins(18, 14, 18, 16)
         fl.setSpacing(12)
+
+        fl.addLayout(tab_row)
 
         self.account = QComboBox()
         fl.addWidget(field_group("转存到哪个账号 *", self.account))
 
-        # 分享 / 群组 各自的输入区（切换）
+        # 分享 / 群组 各自的输入区（切换）。用 Maximum 高度策略，避免被拉伸出空白
         self.input_stack = QStackedWidget()
+        self.input_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.input_stack.addWidget(self._build_share_input())
         self.input_stack.addWidget(self._build_group_input())
         fl.addWidget(self.input_stack)
@@ -165,6 +173,7 @@ class AutoSyncPage(QWidget):
         self.note.setPlaceholderText("便于识别，如：BL讲义更新")
         fl.addWidget(field_group("任务备注（可选）", self.note))
         root.addWidget(form_card)
+        root.addStretch()  # 卡片按内容高度停靠顶部，多余空间留白在下方，避免中间空档
 
         btn_row = QHBoxLayout()
         self.cancel_edit_btn = QPushButton("取消编辑")

@@ -1,4 +1,8 @@
 """全局 QSS 样式：浅色蓝调、细腻质感，贴近 NeoPan。"""
+from pathlib import Path
+
+# 勾选框选中态的白色对勾（QSS image 用绝对路径，正斜杠）
+_CHECK_SVG = (Path(__file__).resolve().parent / "ui" / "assets" / "check.svg").as_posix()
 
 # 调色板
 PRIMARY = "#2f6bff"
@@ -120,6 +124,16 @@ QPushButton#Tab {{
 }}
 QPushButton#Tab:checked {{ background: {PRIMARY}; color: white; }}
 
+/* 分段模式按钮（未选白底描边，选中蓝底），用于广告插入/自动同步等 */
+QPushButton#ModeTab {{
+    background: white; border: 1px solid #e3e8f1; border-radius: 9px;
+    padding: 11px 14px; color: #5b6473; font-weight: 600; font-size: 13.5px;
+}}
+QPushButton#ModeTab:hover {{ border-color: {PRIMARY}; color: {PRIMARY}; }}
+QPushButton#ModeTab:checked {{
+    background: {PRIMARY}; color: white; border-color: {PRIMARY};
+}}
+
 /* ---- 任务面板渐变头 ---- */
 QFrame#SyncHeader {{
     border-radius: 8px;
@@ -144,6 +158,7 @@ QCheckBox::indicator {{
 }}
 QCheckBox::indicator:checked {{
     background: {PRIMARY}; border-color: {PRIMARY};
+    image: url("{_CHECK_SVG}");
 }}
 
 /* ---- 表格 / 列表 ---- */

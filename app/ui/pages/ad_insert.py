@@ -95,15 +95,21 @@ class InsertWorker(QThread):
 
 
 class PickRow(QFrame):
+    """整行可点的选择行：图标 + 文本 + 数量徽标 + 网盘云图标。"""
+
     def __init__(self, icon: str, text: str, button_tip: str, on_click):
         super().__init__()
         self.setObjectName("PickRow")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(54)
+        self.setToolTip(button_tip)
+        self._on_click = on_click
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 10, 8)
-        lay.setSpacing(9)
+        lay.setContentsMargins(14, 10, 12, 10)
+        lay.setSpacing(11)
 
         self.icon = QLabel()
-        self.icon.setPixmap(make_pixmap(icon, "#6b7a90", 18))
+        self.icon.setPixmap(make_pixmap(icon, "#8a94a6", 20))
         lay.addWidget(self.icon)
 
         self.text = QLabel(text)
@@ -112,20 +118,24 @@ class PickRow(QFrame):
 
         self.badge = QLabel("0")
         self.badge.setObjectName("MemberBadge")
+        self.badge.hide()
         lay.addWidget(self.badge)
 
-        self.btn = QPushButton()
-        self.btn.setObjectName("IconBtn")
-        self.btn.setIcon(make_icon("search", "#2f6bff", 17))
-        self.btn.setIconSize(QSize(17, 17))
-        self.btn.setFixedSize(34, 30)
-        self.btn.setToolTip(button_tip)
-        self.btn.clicked.connect(on_click)
-        lay.addWidget(self.btn)
+        self.cloud = QLabel()
+        self.cloud.setPixmap(make_pixmap("cloud", "#2f6bff", 18))
+        lay.addWidget(self.cloud)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._on_click()
 
     def set_value(self, text: str, count: int):
         self.text.setText(text)
-        self.badge.setText(str(count))
+        if count > 0:
+            self.badge.setText(str(count))
+            self.badge.show()
+        else:
+            self.badge.hide()
 
 
 class AdInsertPage(QWidget):
@@ -169,23 +179,26 @@ class AdInsertPage(QWidget):
         fl.addWidget(field_group("执行账号 *", self.account))
 
         mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
         self.mode_group = QButtonGroup(self)
-        self.random_btn = QPushButton("随机插入")
-        self.random_btn.setObjectName("Tab")
+        self.random_btn = QPushButton("  随机插入")
+        self.random_btn.setObjectName("ModeTab")
         self.random_btn.setCheckable(True)
         self.random_btn.setChecked(True)
-        self.random_btn.setIcon(make_icon("shuffle", "#ffffff", 15))
-        self.target_btn = QPushButton("指定插入")
-        self.target_btn.setObjectName("Tab")
+        self.random_btn.setCursor(Qt.PointingHandCursor)
+        self.random_btn.setIcon(make_icon("shuffle", "#ffffff", 16))
+        self.target_btn = QPushButton("  指定插入")
+        self.target_btn.setObjectName("ModeTab")
         self.target_btn.setCheckable(True)
-        self.target_btn.setIcon(make_icon("target", "#5b6473", 15))
+        self.target_btn.setCursor(Qt.PointingHandCursor)
+        self.target_btn.setIcon(make_icon("target", "#5b6473", 16))
         self.mode_group.addButton(self.random_btn)
         self.mode_group.addButton(self.target_btn)
         self.mode_group.setExclusive(True)
         self.random_btn.clicked.connect(lambda: self._set_mode("random"))
         self.target_btn.clicked.connect(lambda: self._set_mode("fixed"))
-        mode_row.addWidget(self.random_btn)
-        mode_row.addWidget(self.target_btn)
+        mode_row.addWidget(self.random_btn, 1)
+        mode_row.addWidget(self.target_btn, 1)
         fl.addLayout(mode_row)
 
         fl.addWidget(field_label("广告文件 *"))
@@ -195,16 +208,20 @@ class AdInsertPage(QWidget):
         fl.addWidget(hline_spacer())
 
         fl.addWidget(field_label("目标文件夹 *"))
-        self.target_row = PickRow("folder", "点击选择目标文件夹", "选择要扫描的网盘文件夹", self.pick_target_folder)
+        self.target_row = PickRow("home", "点击选择目标文件夹", "选择要扫描的网盘文件夹", self.pick_target_folder)
         fl.addWidget(self.target_row)
 
-        hint = label("随机插入：每个目标文件夹随机复制 1 个广告文件；指定插入：复制全部已选广告文件。", "Muted")
+        hint = label("随机插入：每个目标文件夹随机放 1 个广告；指定插入：放全部已选广告。", "Muted")
         hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:12px; margin-top:2px;")
         fl.addWidget(hint)
+        fl.addStretch()
         root.addWidget(form, 1)
 
         self.scan_btn = QPushButton("  扫描文件夹")
         self.scan_btn.setObjectName("Primary")
+        self.scan_btn.setMinimumHeight(46)
+        self.scan_btn.setCursor(Qt.PointingHandCursor)
         self.scan_btn.setIcon(make_icon("search", "#ffffff", 16))
         self.scan_btn.clicked.connect(self.scan_folders)
         root.addWidget(self.scan_btn)

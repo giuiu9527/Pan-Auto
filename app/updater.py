@@ -352,6 +352,7 @@ def download_release_asset(state: dict) -> tuple[bool, str]:
     asset_name = state.get("asset_name") or f"Pan-Auto-{state.get('tag_name', 'latest')}-windows-x64.zip"
     target = updates_dir / asset_name
 
+    # 1) 优先用 gh（本机装了 gh 且登录时，公开/私有均可）
     ok, msg = _run_gh(
         [
             "release",
@@ -370,22 +371,44 @@ def download_release_asset(state: dict) -> tuple[bool, str]:
     if ok and target.exists():
         return True, str(target)
 
+    # 2) 直接 HTTP 下载：公开仓库用免登录直链，无需 gh / token
     token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
-    if not token:
-        return False, msg or f"下载失败。私有库需要 gh 登录，或设置 {GITHUB_TOKEN_ENV}"
+    errors = [msg] if msg else []
+    for url, need_token in _download_candidates(state, token):
+        headers = {
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "Accept": "application/octet-stream",
+        }
+        if need_token and token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=300) as r, target.open("wb") as f:
+                shutil.copyfileobj(r, f)
+            if target.exists() and target.stat().st_size > 0:
+                return True, str(target)
+            errors.append("下载内容为空")
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
 
-    url = state.get("asset_url") or state.get("browser_download_url")
-    if not url:
-        return False, "Release 资产缺少下载地址"
-    headers = _github_headers()
-    headers["Accept"] = "application/octet-stream"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r, target.open("wb") as f:
-            shutil.copyfileobj(r, f)
-        return True, str(target)
-    except Exception as e:  # noqa: BLE001
-        return False, f"下载 Release 资产失败：{e}"
+    detail = "; ".join(str(e) for e in errors if e)
+    return False, f"下载更新包失败：{detail or '未找到可用下载地址（可安装 gh 或设置 ' + GITHUB_TOKEN_ENV + '）'}"
+
+
+def _download_candidates(state: dict, token: str) -> list[tuple[str, bool]]:
+    """按优先级返回 (下载地址, 是否需要 token)。公开直链优先、免登录。"""
+    cands: list[tuple[str, bool]] = []
+    bdl = state.get("browser_download_url") or ""
+    au = state.get("asset_url") or ""
+    # 公开发布直链 github.com/<repo>/releases/download/...：任何人可下，免登录
+    if bdl:
+        cands.append((bdl, False))
+    if au and "/releases/download/" in au:
+        cands.append((au, False))
+    # API 资产直链 api.github.com/.../assets/<id>：私有库需 token
+    if au and "api.github.com" in au:
+        cands.append((au, True))
+    return cands
 
 
 def launch_windows_replacer(zip_path: Path) -> tuple[bool, str]:

@@ -14,6 +14,8 @@ from app.core.transfer import run_task, is_task_due, next_run_ts
 
 
 class Scheduler(QThread):
+    # 一个任务开始跑：task_id（UI 可显示"运行中"）
+    task_started = Signal(int)
     # 一个任务跑完：task_id, 统计结果
     task_ran = Signal(int, dict)
     # 每轮扫描结束（UI 可借此刷新列表/日志）
@@ -51,6 +53,7 @@ class Scheduler(QThread):
             if not is_task_due(t):
                 continue
             try:
+                self.task_started.emit(t["id"])
                 result = run_task(t)
                 self.task_ran.emit(t["id"], result)
                 self._log_done(t, result)

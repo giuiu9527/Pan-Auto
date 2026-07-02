@@ -370,9 +370,14 @@ class MainWindow(QWidget):
 
         # 后台定时调度器：自动跑到期的同步任务
         self.scheduler = Scheduler()
+        self.scheduler.task_started.connect(self._on_scheduled_task_started)
         self.scheduler.task_ran.connect(self._on_scheduled_task_ran)
         self.scheduler.swept.connect(self._on_scheduler_swept)
         self.scheduler.start()
+
+    def _on_scheduled_task_started(self, task_id: int):
+        if self.stack.currentWidget() is self.auto:
+            self.auto.reload_tasks()
 
         self._setup_tray()
 

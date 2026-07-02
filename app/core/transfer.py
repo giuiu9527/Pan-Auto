@@ -7,6 +7,7 @@ import time
 import random
 import re
 import json
+import threading
 from typing import Callable, Optional
 
 from app.netdisk import get_client_for_account
@@ -36,6 +37,26 @@ EMPTY = {"transferred": 0, "skipped": 0, "renamed": 0, "error": ""}
 
 def _noop(level: str, msg: str) -> None:
     pass
+
+
+# 正在运行的任务 id（供任务列表显示"运行中"）。跨线程读写，加锁。
+_RUNNING_LOCK = threading.Lock()
+_RUNNING_IDS: set = set()
+
+
+def set_task_running(task_id, on: bool) -> None:
+    if task_id is None:
+        return
+    with _RUNNING_LOCK:
+        if on:
+            _RUNNING_IDS.add(task_id)
+        else:
+            _RUNNING_IDS.discard(task_id)
+
+
+def running_task_ids() -> set:
+    with _RUNNING_LOCK:
+        return set(_RUNNING_IDS)
 
 
 def _result(transferred=0, skipped=0, renamed=0, error="") -> dict:
@@ -96,10 +117,15 @@ def _folder_ref(link) -> Optional[dict]:
 # ---- 分发入口 ----
 def run_task(task: dict, log: Optional[LogFn] = None) -> dict:
     """执行一个任务，返回统计 {transferred, skipped, renamed, error}。"""
-    kind = task.get("kind", "share")
-    if kind in ("friend", "group"):
-        return _run_msg_task(task, log)
-    return _run_share_task(task, log)
+    tid = task.get("id")
+    set_task_running(tid, True)
+    try:
+        kind = task.get("kind", "share")
+        if kind in ("friend", "group"):
+            return _run_msg_task(task, log)
+        return _run_share_task(task, log)
+    finally:
+        set_task_running(tid, False)
 
 
 # ==========================================================================

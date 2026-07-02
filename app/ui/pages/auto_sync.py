@@ -26,7 +26,7 @@ from app.ui.widgets import card, field_label, field_group, label
 from app.ui.icons import make_icon, make_pixmap
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.group_picker import GroupPickerPopup
-from app.core.transfer import run_task, next_run_ts
+from app.core.transfer import run_task, next_run_ts, running_task_ids, set_task_running
 from app.netdisk import account_display_name
 from app import db
 
@@ -472,6 +472,7 @@ class AutoSyncPage(QWidget):
     # ---- 任务列表 ----
     def reload_tasks(self):
         tasks = db.list_tasks()
+        running = running_task_ids()
         self.table.setRowCount(0)
         enabled = 0
         for t in tasks:
@@ -486,17 +487,20 @@ class AutoSyncPage(QWidget):
             self.table.setItem(r, 1, QTableWidgetItem(t.get("account_name") or "—"))
             self.table.setItem(r, 2, QTableWidgetItem(t["target_dir"]))
             self.table.setItem(r, 3, QTableWidgetItem(_interval_text(t["interval"])))
-            if t["enabled"]:
+            if t["id"] in running:
+                stxt, scolor = "⟳ 运行中", Qt.blue
+            elif t["enabled"]:
                 nxt = next_run_ts(t)
                 if nxt:
                     import time as _t
                     stxt = "● 下次 " + _t.strftime("%m-%d %H:%M", _t.localtime(nxt))
                 else:
                     stxt = "● 待首次同步"
+                scolor = Qt.darkGreen
             else:
-                stxt = "○ 暂停"
+                stxt, scolor = "○ 暂停", Qt.gray
             status = QTableWidgetItem(stxt)
-            status.setForeground(Qt.darkGreen if t["enabled"] else Qt.gray)
+            status.setForeground(scolor)
             self.table.setItem(r, 4, status)
 
             ops = QWidget()
@@ -546,11 +550,13 @@ class AutoSyncPage(QWidget):
         if task.get("account_id") is None or db.get_account(task["account_id"]) is None:
             QMessageBox.warning(self, "账号不可用", "该任务绑定的账号已删除，请重建任务")
             return
+        set_task_running(task.get("id"), True)  # 立即在列表显示"运行中"
         worker = TransferWorker(task)
         worker.finished_task.connect(self._on_transfer_done)
         worker.finished.connect(lambda w=worker: self._workers.remove(w) if w in self._workers else None)
         self._workers.append(worker)
         worker.start()
+        self.reload_tasks()
         QMessageBox.information(self, "已开始", "同步已在后台执行，进度见「转存记录」。")
 
     def _on_transfer_done(self, result: dict):

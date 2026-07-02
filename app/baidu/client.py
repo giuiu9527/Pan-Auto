@@ -163,13 +163,24 @@ class BaiduPanClient:
     # ---- 分享转存（骨架，Phase 2 实现）----
     @staticmethod
     def parse_share_link(link: str) -> dict:
-        """解析分享链接，提取 surl 与（可能内嵌的）提取码。"""
+        """解析分享链接，提取 surl 与（可能内嵌的）提取码。
+
+        支持两种形式：
+        - /s/1XXXX?pwd=yyyy （surl 在路径，带前导 1）
+        - /share/init?surl=XXXX&pwd=yyyy （surl 在查询参数，无前导 1）
+        """
         pwd = ""
-        m = re.search(r"pwd=([0-9a-zA-Z]+)", link)
+        m = re.search(r"(?:pwd|passcode)=([0-9a-zA-Z]+)", link)
         if m:
             pwd = m.group(1)
-        m2 = re.search(r"/s/1?([0-9a-zA-Z_-]+)", link)
-        surl = m2.group(1) if m2 else ""
+        surl = ""
+        m_q = re.search(r"[?&]surl=([0-9a-zA-Z_-]+)", link)
+        if m_q:
+            surl = m_q.group(1)
+        else:
+            m2 = re.search(r"/s/1?([0-9a-zA-Z_-]+)", link)
+            if m2:
+                surl = m2.group(1)
         return {"surl": surl, "pwd": pwd}
 
     # ---- 分享转存完整流程 ----

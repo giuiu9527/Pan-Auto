@@ -46,6 +46,7 @@ def _run_git(args: list[str], timeout: int = 60) -> tuple[bool, str]:
             errors="replace",
             timeout=timeout,
             creationflags=flags,
+            stdin=subprocess.DEVNULL,  # 无控制台打包版必须关 stdin，否则子进程卡死
         )
     except FileNotFoundError:
         return False, "未找到 Git，请先安装 Git for Windows"
@@ -70,6 +71,7 @@ def _run_gh(args: list[str], timeout: int = 90) -> tuple[bool, str]:
             errors="replace",
             timeout=timeout,
             creationflags=flags,
+            stdin=subprocess.DEVNULL,  # 无控制台打包版必须关 stdin，否则子进程卡死
         )
     except FileNotFoundError:
         return False, "未找到 GitHub CLI，请安装 gh 或设置 PAN_AUTO_GITHUB_TOKEN"
@@ -152,14 +154,16 @@ def _latest_release_via_api() -> tuple[bool, dict | str]:
 
 
 def _latest_release() -> tuple[bool, dict | str, str]:
-    ok, data = _latest_release_via_gh()
-    if ok:
-        return True, data, "gh"
-    gh_msg = str(data)
+    # 公开发布库：优先匿名 HTTP API（快、无需 gh 子进程，避免打包版卡住）；
+    # gh 仅作兜底（私有仓库或 API 被限流时）。
     ok, data = _latest_release_via_api()
     if ok:
         return True, data, "api"
-    return False, f"{gh_msg}\n{data}", ""
+    api_msg = str(data)
+    ok, data = _latest_release_via_gh()
+    if ok:
+        return True, data, "gh"
+    return False, f"{api_msg}\n{data}", ""
 
 
 def is_git_repo() -> bool:
@@ -354,28 +358,10 @@ def download_release_asset(state: dict) -> tuple[bool, str]:
     asset_name = state.get("asset_name") or f"Pan-Auto-{state.get('tag_name', 'latest')}-windows-x64.zip"
     target = updates_dir / asset_name
 
-    # 1) 优先用 gh（本机装了 gh 且登录时，公开/私有均可）
-    ok, msg = _run_gh(
-        [
-            "release",
-            "download",
-            state["tag_name"],
-            "--repo",
-            GITHUB_REPO,
-            "--pattern",
-            asset_name,
-            "--dir",
-            str(updates_dir),
-            "--clobber",
-        ],
-        timeout=300,
-    )
-    if ok and target.exists():
-        return True, str(target)
-
-    # 2) 直接 HTTP 下载：公开仓库用免登录直链，无需 gh / token
     token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
-    errors = [msg] if msg else []
+    errors = []
+
+    # 1) 公开发布库：匿名直链下载（无需 gh 子进程 / token），快且稳
     for url, need_token in _download_candidates(state, token):
         headers = {
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
@@ -393,8 +379,22 @@ def download_release_asset(state: dict) -> tuple[bool, str]:
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
 
+    # 2) 兜底：gh（私有库或直链失败时）
+    ok, msg = _run_gh(
+        [
+            "release", "download", state["tag_name"],
+            "--repo", GITHUB_REPO, "--pattern", asset_name,
+            "--dir", str(updates_dir), "--clobber",
+        ],
+        timeout=300,
+    )
+    if ok and target.exists():
+        return True, str(target)
+    if msg:
+        errors.append(msg)
+
     detail = "; ".join(str(e) for e in errors if e)
-    return False, f"下载更新包失败：{detail or '未找到可用下载地址（可安装 gh 或设置 ' + GITHUB_TOKEN_ENV + '）'}"
+    return False, f"下载更新包失败：{detail or '未找到可用下载地址'}"
 
 
 def _download_candidates(state: dict, token: str) -> list[tuple[str, bool]]:

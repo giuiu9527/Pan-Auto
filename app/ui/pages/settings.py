@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QScrollArea,
     QButtonGroup,
+    QCheckBox,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -21,6 +22,7 @@ from app.baidu.client import BaiduPanClient
 from app.quark.client import QuarkPanClient, parse_quark_cookie
 from app.netdisk import provider_label
 from app import db
+from app.autostart import is_autostart_enabled, set_autostart
 
 
 class AccountRow(QFrame):
@@ -81,6 +83,13 @@ class SettingsPage(QWidget):
         root.addWidget(
             label("可添加多个网盘账号；后续任务可分别绑定到不同账号。", "Muted")
         )
+
+        # 开机自启
+        self.autostart_cb = QCheckBox("开机自动启动")
+        self.autostart_cb.setStyleSheet("font-size:13px; padding:2px 0;")
+        self.autostart_cb.setChecked(is_autostart_enabled())
+        self.autostart_cb.toggled.connect(self._on_autostart_toggled)
+        root.addWidget(self.autostart_cb)
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -295,3 +304,7 @@ class SettingsPage(QWidget):
             )
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "错误", f"添加失败：{e}")
+
+    # ---- 开机自启 ----
+    def _on_autostart_toggled(self, checked: bool):
+        set_autostart(checked)

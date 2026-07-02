@@ -20,7 +20,7 @@ $env:PAN_AUTO_DISABLE_UPDATE = "1"
 .\.venv\Scripts\python.exe -m py_compile app\core\transfer.py ...
 ```
 
-- 入口 `main.py`：顶部 `import PySide6.QtWebEngineWidgets`（内嵌浏览器登录用），**需要 GPU/OpenGL 上下文，无法纯 headless 跑完整 app**。
+- 入口 `main.py`：正常启动 GUI；带 `--baidu-login` 时以**子进程模式**跑 WebView2 登录（见 `app/baidu/webview_login.py`）。已**移除 QtWebEngine**（登录改用系统 Edge WebView2，包体 556MB→127MB）。
 - **离屏冒烟测试**：`QT_QPA_PLATFORM=offscreen`，但要避开真实网络线程 —— 用 `db.list_accounts = lambda *a,**k: []` 打桩，否则页面构造时会起后台网络 QThread。
 - **调真实接口**：venv python 里 `from app.baidu.client import get_client_for_account` + `db.get_active_account()` 拿真实登录态直接打接口。终端打印中文要 `.encode("utf-8","ignore").decode()`（Windows cp936 会报错）。
 - **打包版**：`dist/Pan-Auto/Pan-Auto.exe` 是**旧的 PyInstaller 构建**，改源码不会反映到它。重新打包：`.\.venv\Scripts\pyinstaller.exe Pan-Auto.spec`。
@@ -47,7 +47,8 @@ app/ui/
   main_window.py            主窗口、导航、调度器启停、更新检查
   netdisk_browser.py        ★可复用网盘文件浏览器（provider 中立）
   group_picker.py           群文件夹选择器弹窗（NeoPan 风格）
-  login_dialog.py           百度内嵌浏览器登录（WebEngine）
+  login_dialog.py           百度登录：子进程调系统 WebView2（缺运行时弹窗引导下载）
+  baidu/webview_login.py    WebView2 登录子进程（pywebview + pythonnet，抓 Cookie）
   pages/                    home / auto_sync / batch_rename / ad_insert /
                             friend_message / logs / settings / placeholder
 ```

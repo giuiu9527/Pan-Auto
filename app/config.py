@@ -3,7 +3,7 @@ from pathlib import Path
 
 APP_NAME = "Pan-Auto"
 APP_TITLE = "Pan-Auto · 网盘自动转存"
-APP_VERSION = "V1.7"
+APP_VERSION = "V1.8"
 
 # 用户数据目录：%APPDATA%\Pan-Auto （Windows）
 import os

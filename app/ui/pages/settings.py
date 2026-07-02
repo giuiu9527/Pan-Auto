@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -90,6 +91,25 @@ class SettingsPage(QWidget):
         self.autostart_cb.setChecked(is_autostart_enabled())
         self.autostart_cb.toggled.connect(self._on_autostart_toggled)
         root.addWidget(self.autostart_cb)
+
+        # 关闭按钮行为
+        close_row = QHBoxLayout()
+        close_row.setSpacing(8)
+        close_lbl = QLabel("点关闭按钮时：")
+        close_lbl.setStyleSheet("font-size:13px;")
+        close_row.addWidget(close_lbl)
+        self.close_action = QComboBox()
+        self.close_action.addItem("每次询问", "ask")
+        self.close_action.addItem("最小化到托盘", "minimize")
+        self.close_action.addItem("退出程序", "quit")
+        cur = db.get_setting("close_action", "ask")
+        idx = self.close_action.findData(cur)
+        self.close_action.setCurrentIndex(idx if idx >= 0 else 0)
+        self.close_action.currentIndexChanged.connect(self._on_close_action_changed)
+        self.close_action.setFixedWidth(160)
+        close_row.addWidget(self.close_action)
+        close_row.addStretch()
+        root.addLayout(close_row)
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -308,3 +328,7 @@ class SettingsPage(QWidget):
     # ---- 开机自启 ----
     def _on_autostart_toggled(self, checked: bool):
         set_autostart(checked)
+
+    # ---- 关闭按钮行为 ----
+    def _on_close_action_changed(self, _idx: int):
+        db.set_setting("close_action", self.close_action.currentData())

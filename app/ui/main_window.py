@@ -13,16 +13,21 @@ from PySide6.QtWidgets import (
     QFrame,
     QMessageBox,
     QProgressDialog,
+    QSystemTrayIcon,
+    QMenu,
+    QCheckBox,
 )
 from PySide6.QtCore import Qt, QPoint, QSize, QEvent, QThread, Signal
-from PySide6.QtGui import QMouseEvent, QIcon
+from PySide6.QtGui import QMouseEvent, QIcon, QAction
 
 from app.config import APP_TITLE, APP_VERSION
 
 import os as _os
 import sys as _sys
 if getattr(_sys, 'frozen', False):
-    _ICON_PATH = _os.path.join(_os.path.dirname(_sys.executable), 'app', 'ui', 'assets', 'app.ico')
+    # PyInstaller onedir：资源在 _internal 下（_MEIPASS），不是 exe 同级目录
+    _base = getattr(_sys, '_MEIPASS', _os.path.dirname(_sys.executable))
+    _ICON_PATH = _os.path.join(_base, 'app', 'ui', 'assets', 'app.ico')
 else:
     _ICON_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'assets', 'app.ico')
 from app import db
@@ -305,10 +310,16 @@ class MainWindow(QWidget):
         self.setWindowFlag(Qt.FramelessWindowHint)
         self.resize(1120, 740)
         self.setMinimumSize(940, 620)
-        if _os.path.exists(_ICON_PATH):
-            self.setWindowIcon(QIcon(_ICON_PATH))
+        self._app_icon = QIcon(_ICON_PATH) if _os.path.exists(_ICON_PATH) else QIcon()
+        if not self._app_icon.isNull():
+            self.setWindowIcon(self._app_icon)
+            _app = QApplication.instance()
+            if _app:
+                _app.setWindowIcon(self._app_icon)  # 任务栏/托盘统一用自定义图标
         self._update_workers = []
         self._force_update_required = False
+        self._really_quit = False
+        self._tray_notified = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -363,6 +374,63 @@ class MainWindow(QWidget):
         self.scheduler.swept.connect(self._on_scheduler_swept)
         self.scheduler.start()
 
+        self._setup_tray()
+
+    # ---- 系统托盘 ----
+    def _setup_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        if not self._app_icon.isNull():
+            self.tray.setIcon(self._app_icon)
+        self.tray.setToolTip("Pan-Auto · 网盘自动转存")
+        menu = QMenu()
+        act_show = QAction("显示主界面", self)
+        act_show.triggered.connect(self._show_window)
+        act_quit = QAction("退出", self)
+        act_quit.triggered.connect(self._quit_from_tray)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_window()
+
+    def _show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._really_quit = True
+        self.close()
+
+    def _notify_tray_once(self):
+        if self._tray_notified or not hasattr(self, "tray"):
+            return
+        self._tray_notified = True
+        try:
+            self.tray.showMessage(
+                "Pan-Auto",
+                "已最小化到托盘，后台继续定时同步。双击托盘图标可恢复。",
+                QSystemTrayIcon.Information,
+                3000,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _shutdown(self):
+        try:
+            if hasattr(self, "scheduler"):
+                self.scheduler.stop()
+                self.scheduler.wait(3000)
+        except Exception:  # noqa: BLE001
+            pass
+        if hasattr(self, "tray"):
+            self.tray.hide()
+
     def _on_scheduled_task_ran(self, task_id: int, result: dict):
         # 定时任务跑完，刷新任务列表与日志（若正显示）
         if self.stack.currentWidget() is self.auto:
@@ -375,12 +443,53 @@ class MainWindow(QWidget):
             self.logs.reload()
 
     def closeEvent(self, e):
-        try:
-            if hasattr(self, "scheduler"):
-                self.scheduler.stop()
-                self.scheduler.wait(3000)
-        finally:
+        # 从托盘「退出」或已确定退出 → 真正关闭
+        if self._really_quit:
+            self._shutdown()
             super().closeEvent(e)
+            return
+
+        action = db.get_setting("close_action", "ask")  # ask / minimize / quit
+        if action == "quit":
+            self._really_quit = True
+            self._shutdown()
+            super().closeEvent(e)
+            return
+        if action == "minimize":
+            e.ignore()
+            self.hide()
+            self._notify_tray_once()
+            return
+
+        # ask：弹窗询问 + 记住选项
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭 Pan-Auto")
+        box.setIcon(QMessageBox.Question)
+        box.setText("要最小化到托盘，还是退出程序？")
+        box.setInformativeText("最小化后程序在后台继续定时同步。")
+        min_btn = box.addButton("最小化到托盘", QMessageBox.AcceptRole)
+        quit_btn = box.addButton("退出程序", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        remember = QCheckBox("记住我的选择（可在「设置」里更改）")
+        box.setCheckBox(remember)
+        box.setDefaultButton(min_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is min_btn:
+            if remember.isChecked():
+                db.set_setting("close_action", "minimize")
+            e.ignore()
+            self.hide()
+            self._notify_tray_once()
+        elif clicked is quit_btn:
+            if remember.isChecked():
+                db.set_setting("close_action", "quit")
+            self._really_quit = True
+            self._shutdown()
+            super().closeEvent(e)
+        else:
+            e.ignore()  # 取消关闭
 
     def changeEvent(self, e):
         super().changeEvent(e)

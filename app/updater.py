@@ -473,41 +473,68 @@ param(
     [Parameter(Mandatory=$true)][int]$PidToWait
 )
 
-$ErrorActionPreference = "Stop"
+$marker = Join-Path $InstallDir $ExeName
+$internal = Join-Path $InstallDir "_internal"
+$logDir = Split-Path -Parent $Zip
+$log = Join-Path $logDir "update.log"
+function Log($m) { try { Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $m) } catch {} }
+function Restart() { try { Start-Process -FilePath $marker -WorkingDirectory $InstallDir; Log "restarted" } catch { Log ("restart failed: " + $_) } }
+
+Log ("updater start pid=" + $PidToWait + " dir=" + $InstallDir)
+
+# 1. 等主进程退出 + 杀残留子进程（WebView2 等），释放文件占用
 Wait-Process -Id $PidToWait -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 1200
+Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+try {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($InstallDir.ToLower()) } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+} catch {}
 Start-Sleep -Milliseconds 800
 
-$marker = Join-Path $InstallDir $ExeName
-if (-not (Test-Path -LiteralPath $marker)) {
-    throw "安装目录校验失败：$marker"
+# 2. 解压
+$workRoot = Join-Path $logDir ("stage-" + [guid]::NewGuid().ToString("N"))
+try {
+    New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+    Expand-Archive -LiteralPath $Zip -DestinationPath $workRoot -Force
+} catch {
+    Log ("unzip failed: " + $_); Restart; exit 1
 }
-$internal = Join-Path $InstallDir "_internal"
-if (-not (Test-Path -LiteralPath $internal)) {
-    throw "未找到 _internal 目录，当前不是标准运行包结构"
-}
-
-$workRoot = Join-Path ([IO.Path]::GetDirectoryName($Zip)) ("stage-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
-Expand-Archive -LiteralPath $Zip -DestinationPath $workRoot -Force
-
 $source = Join-Path $workRoot "Pan-Auto"
-if (-not (Test-Path -LiteralPath $source)) {
-    $source = $workRoot
-}
+if (-not (Test-Path -LiteralPath $source)) { $source = $workRoot }
 if (-not (Test-Path -LiteralPath (Join-Path $source $ExeName))) {
-    throw "更新包结构不正确，未找到 $ExeName"
-}
-if (-not (Test-Path -LiteralPath (Join-Path $source "_internal"))) {
-    throw "更新包结构不正确，未找到 _internal"
+    Log "bad package: exe missing"; Restart; exit 1
 }
 
-Remove-Item -LiteralPath $marker -Force
-Remove-Item -LiteralPath $internal -Recurse -Force
-Copy-Item -LiteralPath (Join-Path $source $ExeName) -Destination $InstallDir -Force
-Copy-Item -LiteralPath (Join-Path $source "_internal") -Destination $InstallDir -Recurse -Force
-Remove-Item -LiteralPath $workRoot -Recurse -Force
+# 3. 带重试删除旧文件（等解锁，最多约 24 秒）
+function Try-Remove($path) {
+    for ($i = 0; $i -lt 40; $i++) {
+        if (-not (Test-Path -LiteralPath $path)) { return $true }
+        try { Remove-Item -LiteralPath $path -Force -Recurse -ErrorAction Stop; return $true }
+        catch { Start-Sleep -Milliseconds 600 }
+    }
+    return $false
+}
+$okExe = Try-Remove $marker
+$okInt = Try-Remove $internal
+if (-not ($okExe -and $okInt)) { Log "old files locked, remove failed" }
 
-Start-Process -FilePath (Join-Path $InstallDir $ExeName)
+# 4. 复制新文件
+try {
+    Copy-Item -LiteralPath (Join-Path $source $ExeName) -Destination $InstallDir -Force
+    Copy-Item -LiteralPath (Join-Path $source "_internal") -Destination $InstallDir -Recurse -Force
+    Log "replaced ok"
+} catch {
+    Log ("copy failed: " + $_)
+}
+
+Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+try { Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue } catch {}
+
+# 5. 无论成败都重启（避免"更新后打不开"）
+Start-Sleep -Milliseconds 500
+Restart
 '''
 
 

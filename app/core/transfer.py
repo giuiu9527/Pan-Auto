@@ -56,6 +56,15 @@ def is_task_due(task: dict, now: Optional[float] = None) -> bool:
     return (now - last) >= period
 
 
+def next_run_ts(task: dict) -> int:
+    """任务下次运行的时间戳（last_run + 间隔）；从未跑过返回 0。"""
+    last = task.get("last_run") or 0
+    if not last:
+        return 0
+    period = INTERVAL_SECONDS.get(task.get("interval"), INTERVAL_SECONDS["daily"])
+    return int(last) + period
+
+
 # ---- 广告过滤 ----
 def ad_keywords() -> list[str]:
     raw = db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS)

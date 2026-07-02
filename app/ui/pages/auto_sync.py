@@ -26,7 +26,7 @@ from app.ui.widgets import card, field_label, field_group, label
 from app.ui.icons import make_icon, make_pixmap
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.group_picker import GroupPickerPopup
-from app.core.transfer import run_task
+from app.core.transfer import run_task, next_run_ts
 from app.netdisk import account_display_name
 from app import db
 
@@ -486,7 +486,16 @@ class AutoSyncPage(QWidget):
             self.table.setItem(r, 1, QTableWidgetItem(t.get("account_name") or "—"))
             self.table.setItem(r, 2, QTableWidgetItem(t["target_dir"]))
             self.table.setItem(r, 3, QTableWidgetItem(_interval_text(t["interval"])))
-            status = QTableWidgetItem("● 启用" if t["enabled"] else "○ 暂停")
+            if t["enabled"]:
+                nxt = next_run_ts(t)
+                if nxt:
+                    import time as _t
+                    stxt = "● 下次 " + _t.strftime("%m-%d %H:%M", _t.localtime(nxt))
+                else:
+                    stxt = "● 待首次同步"
+            else:
+                stxt = "○ 暂停"
+            status = QTableWidgetItem(stxt)
             status.setForeground(Qt.darkGreen if t["enabled"] else Qt.gray)
             self.table.setItem(r, 4, status)
 

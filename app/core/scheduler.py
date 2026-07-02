@@ -10,7 +10,7 @@ import threading
 from PySide6.QtCore import QThread, Signal
 
 from app import db
-from app.core.transfer import run_task, is_task_due
+from app.core.transfer import run_task, is_task_due, next_run_ts
 
 
 class Scheduler(QThread):
@@ -53,8 +53,26 @@ class Scheduler(QThread):
             try:
                 result = run_task(t)
                 self.task_ran.emit(t["id"], result)
+                self._log_done(t, result)
             except Exception as e:  # noqa: BLE001
                 db.add_log("error", f"任务执行异常（id={t.get('id')}）：{e}", t.get("id"))
+
+    def _log_done(self, task: dict, result: dict):
+        """定时同步跑完记一条清晰的完成提示（带下次同步时间）。"""
+        import time
+
+        name = task.get("note") or task.get("entity_name") or task.get("link") or "任务"
+        # run_task 已更新 last_run，这里据此算下次时间
+        fresh = db.get_task(task["id"]) or task
+        nxt = next_run_ts(fresh)
+        nxt_text = time.strftime("%m-%d %H:%M", time.localtime(nxt)) if nxt else "稍后"
+        db.add_log(
+            "info",
+            f"⏱ 定时同步「{name}」完成：新增 {result.get('transferred', 0)}、"
+            f"跳过 {result.get('skipped', 0)}、改名 {result.get('renamed', 0)}；"
+            f"下次约 {nxt_text}",
+            task["id"],
+        )
 
     def wake_now(self):
         """立即触发一轮扫描（如新增任务后）。"""

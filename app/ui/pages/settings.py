@@ -9,13 +9,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QFrame,
     QScrollArea,
+    QButtonGroup,
 )
 from PySide6.QtCore import Qt, Signal
 
 from app.ui.widgets import card, field_label, label
 from app.ui.icons import make_icon, make_pixmap
 from app.ui.login_dialog import LoginDialog
+from app.ui.netdisk_browser import NetdiskBrowser
 from app.baidu.client import BaiduPanClient
+from app.quark.client import QuarkPanClient, parse_quark_cookie
+from app.netdisk import provider_label
+from app.core.transfer import DEFAULT_AD_KEYWORDS
 from app import db
 
 
@@ -36,10 +41,11 @@ class AccountRow(QFrame):
 
         col = QVBoxLayout()
         col.setSpacing(2)
-        name = QLabel(acc["username"] or "百度用户")
+        name = QLabel(acc["username"] or provider_label(acc.get("provider")))
         name.setStyleSheet("font-weight:600; font-size:14px;")
         col.addWidget(name)
-        sub = QLabel("✓ 当前使用中" if acc["is_active"] else "未启用")
+        prefix = provider_label(acc.get("provider"))
+        sub = QLabel(f"✓ {prefix} · 当前使用中" if acc["is_active"] else f"{prefix} · 未启用")
         sub.setObjectName("Muted")
         sub.setStyleSheet(
             "color:#18a957; font-size:12px;" if acc["is_active"]
@@ -65,6 +71,7 @@ class SettingsPage(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.provider = "baidu"
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 18, 24, 18)
         root.setSpacing(12)
@@ -73,7 +80,7 @@ class SettingsPage(QWidget):
         title.setObjectName("PageTitle")
         root.addWidget(title)
         root.addWidget(
-            label("可添加多个百度账号；每个转存任务可分别绑定到不同账号。", "Muted")
+            label("可添加多个网盘账号；后续任务可分别绑定到不同账号。", "Muted")
         )
 
         body = QHBoxLayout()
@@ -86,15 +93,25 @@ class SettingsPage(QWidget):
         lc.setContentsMargins(16, 14, 16, 14)
         lc.setSpacing(8)
         head = QHBoxLayout()
-        h = QLabel("已登录账号")
-        h.setObjectName("FieldLabel")
-        head.addWidget(h)
+        self.list_title = QLabel("已登录账号")
+        self.list_title.setObjectName("FieldLabel")
+        head.addWidget(self.list_title)
         head.addStretch()
-        add = QPushButton("  添加账号")
-        add.setObjectName("Primary")
-        add.setIcon(make_icon("plus", "#ffffff", 16))
-        add.clicked.connect(self.add_account_browser)
-        head.addWidget(add)
+        self.provider_group = QButtonGroup(self)
+        self.baidu_tab = QPushButton("百度")
+        self.baidu_tab.setObjectName("Tab")
+        self.baidu_tab.setCheckable(True)
+        self.baidu_tab.setChecked(True)
+        self.quark_tab = QPushButton("夸克")
+        self.quark_tab.setObjectName("Tab")
+        self.quark_tab.setCheckable(True)
+        self.provider_group.addButton(self.baidu_tab)
+        self.provider_group.addButton(self.quark_tab)
+        self.provider_group.setExclusive(True)
+        self.baidu_tab.clicked.connect(lambda: self.set_provider("baidu"))
+        self.quark_tab.clicked.connect(lambda: self.set_provider("quark"))
+        head.addWidget(self.baidu_tab)
+        head.addWidget(self.quark_tab)
         lc.addLayout(head)
 
         self.scroll = QScrollArea()
@@ -114,22 +131,89 @@ class SettingsPage(QWidget):
         cl = QVBoxLayout(ck_card)
         cl.setContentsMargins(16, 14, 16, 14)
         cl.setSpacing(7)
-        cl.addWidget(field_label("Cookie 添加（兜底）"))
-        cl.addWidget(
-            label("浏览器登录失败时，从浏览器复制百度网盘 Cookie 粘贴添加。", "Muted")
-        )
+        self.cookie_title = field_label("Cookie 添加（兜底）")
+        cl.addWidget(self.cookie_title)
+        self.cookie_hint = label("", "Muted")
+        self.cookie_hint.setWordWrap(True)
+        cl.addWidget(self.cookie_hint)
         self.cookie_input = QPlainTextEdit()
-        self.cookie_input.setPlaceholderText("BDUSS=xxx; STOKEN=xxx; ...")
         self.cookie_input.setMaximumHeight(120)
         cl.addWidget(self.cookie_input)
-        ck_btn = QPushButton("用 Cookie 添加")
-        ck_btn.setObjectName("Ghost")
-        ck_btn.clicked.connect(self.add_account_cookie)
-        cl.addWidget(ck_btn, alignment=Qt.AlignLeft)
-        cl.addStretch()
+        btns = QHBoxLayout()
+        self.browser_btn = QPushButton("  扫码添加")
+        self.browser_btn.setObjectName("Primary")
+        self.browser_btn.setIcon(make_icon("plus", "#ffffff", 16))
+        self.browser_btn.clicked.connect(self.add_account_browser)
+        btns.addWidget(self.browser_btn)
+        self.ck_btn = QPushButton("用 Cookie 添加")
+        self.ck_btn.setObjectName("Ghost")
+        self.ck_btn.clicked.connect(self.add_account_cookie)
+        btns.addWidget(self.ck_btn)
+        btns.addStretch()
+        cl.addLayout(btns)
+        cl.addWidget(field_label("目录浏览"))
+        self.browser_hint = label("", "Muted")
+        cl.addWidget(self.browser_hint)
+        self.browser = NetdiskBrowser()
+        cl.addWidget(self.browser, 1)
         body.addWidget(ck_card, 2)
 
+        # 广告关键词（好友/群定时同步时用于过滤广告垃圾文件）
+        ad_card = card()
+        al = QVBoxLayout(ad_card)
+        al.setContentsMargins(16, 12, 16, 12)
+        al.setSpacing(6)
+        al.addWidget(field_label("广告关键词（过滤好友/群同步的垃圾文件）"))
+        al.addWidget(
+            label("文件名命中任一关键词就不转存；一行一个或用逗号分隔。", "Muted")
+        )
+        self.ad_input = QPlainTextEdit()
+        self.ad_input.setMaximumHeight(90)
+        self.ad_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
+        al.addWidget(self.ad_input)
+        ad_btn_row = QHBoxLayout()
+        ad_btn_row.addStretch()
+        save_ad = QPushButton("保存广告关键词")
+        save_ad.setObjectName("Ghost")
+        save_ad.clicked.connect(self.save_ad_keywords)
+        ad_btn_row.addWidget(save_ad)
+        al.addLayout(ad_btn_row)
+        root.addWidget(ad_card)
+
+        self._refresh_provider_text()
         self.refresh_accounts()
+        self.refresh_browser()
+
+    def save_ad_keywords(self):
+        db.set_setting("ad_keywords", self.ad_input.toPlainText().strip())
+        QMessageBox.information(self, "已保存", "广告关键词已更新，下次同步生效。")
+
+    def set_provider(self, provider: str):
+        self.provider = provider
+        self._refresh_provider_text()
+        self.refresh_accounts()
+        self.refresh_browser()
+
+    def _refresh_provider_text(self):
+        name = provider_label(self.provider)
+        self.list_title.setText(f"{name}账号")
+        self.cookie_title.setText(f"{name} Cookie 添加")
+        if self.provider == "quark":
+            self.cookie_hint.setText(
+                "在浏览器登录 pan.quark.cn 后，复制请求 Cookie 粘贴到这里。"
+                "已支持夸克账号校验、目录浏览与分享转存（扫码登录后续接入）。"
+            )
+            self.cookie_input.setPlaceholderText("__puus=xxx; kps=xxx; ...")
+            self.browser_btn.setEnabled(False)
+            self.browser_btn.setToolTip("夸克扫码登录后续接入；当前请用 Cookie 添加")
+        else:
+            self.cookie_hint.setText(
+                "浏览器登录失败时，从浏览器复制百度网盘 Cookie 粘贴添加。"
+            )
+            self.cookie_input.setPlaceholderText("BDUSS=xxx; STOKEN=xxx; ...")
+            self.browser_btn.setEnabled(True)
+            self.browser_btn.setToolTip("")
+        self.browser_hint.setText(f"用于验证当前{provider_label(self.provider)}账号是否可读取目录。")
 
     # ---- 列表 ----
     def refresh_accounts(self):
@@ -138,18 +222,30 @@ class SettingsPage(QWidget):
             w = item.widget()
             if w:
                 w.deleteLater()
-        accounts = db.list_accounts()
+        accounts = db.list_accounts(self.provider)
         if not accounts:
-            empty = label("还没有账号，点右上「添加账号」开始。", "Muted")
+            empty = label(f"还没有{provider_label(self.provider)}账号。", "Muted")
             empty.setAlignment(Qt.AlignCenter)
             self.list_lay.insertWidget(0, empty)
             return
         for i, acc in enumerate(accounts):
             self.list_lay.insertWidget(i, AccountRow(acc, self))
+        self.refresh_browser()
+
+    def refresh_browser(self):
+        accounts = db.list_accounts(self.provider)
+        if not accounts:
+            self.browser.status.setText(f"暂无{provider_label(self.provider)}账号")
+            self.browser.list.clear()
+            self.browser.path_label.setText("/")
+            return
+        account = next((x for x in accounts if x.get("is_active")), accounts[0])
+        self.browser.set_account(account["id"])
 
     def set_active(self, account_id: int):
         db.set_active_account(account_id)
         self.refresh_accounts()
+        self.refresh_browser()
         self.account_changed.emit()
 
     def remove(self, account_id: int, username: str):
@@ -161,10 +257,14 @@ class SettingsPage(QWidget):
         ):
             db.delete_account(account_id)
             self.refresh_accounts()
+            self.refresh_browser()
             self.account_changed.emit()
 
     # ---- 添加：浏览器 ----
     def add_account_browser(self):
+        if self.provider != "baidu":
+            QMessageBox.information(self, "提示", "夸克暂时请使用 Cookie 添加。")
+            return
         dlg = LoginDialog(self)
         dlg.logged_in.connect(self._save_from_cookies)
         dlg.exec()
@@ -176,8 +276,11 @@ class SettingsPage(QWidget):
             if not info.get("username"):
                 QMessageBox.warning(self, "失败", "未能确认账号，请重试")
                 return
-            db.add_account(info["username"], cookies, info.get("bdstoken", ""))
+            db.add_account(
+                info["username"], cookies, info.get("bdstoken", ""), provider="baidu"
+            )
             self.refresh_accounts()
+            self.refresh_browser()
             self.account_changed.emit()
             QMessageBox.information(self, "成功", f"已添加账号：{info['username']}")
         except Exception as e:  # noqa: BLE001
@@ -189,24 +292,33 @@ class SettingsPage(QWidget):
         if not raw:
             QMessageBox.warning(self, "提示", "请粘贴 Cookie")
             return
-        cookies = {}
-        for part in raw.split(";"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                cookies[k.strip()] = v.strip()
-        if "BDUSS" not in cookies:
-            QMessageBox.warning(self, "提示", "Cookie 中缺少 BDUSS")
+        cookies = parse_quark_cookie(raw)
+        if self.provider == "baidu" and "BDUSS" not in cookies:
+            QMessageBox.warning(self, "提示", "百度 Cookie 中缺少 BDUSS")
+            return
+        if self.provider == "quark" and not cookies:
+            QMessageBox.warning(self, "提示", "请粘贴夸克 Cookie")
             return
         try:
-            client = BaiduPanClient(cookies)
+            client = QuarkPanClient(cookies) if self.provider == "quark" else BaiduPanClient(cookies)
             info = client.get_user_info()
             if not info.get("username"):
                 QMessageBox.warning(self, "失败", "Cookie 无效或已过期")
                 return
-            db.add_account(info["username"], cookies, info.get("bdstoken", ""))
+            db.add_account(
+                info["username"],
+                cookies,
+                info.get("bdstoken", ""),
+                provider=self.provider,
+            )
             self.cookie_input.clear()
             self.refresh_accounts()
+            self.refresh_browser()
             self.account_changed.emit()
-            QMessageBox.information(self, "成功", f"已添加账号：{info['username']}")
+            QMessageBox.information(
+                self,
+                "成功",
+                f"已添加{provider_label(self.provider)}账号：{info['username']}",
+            )
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "错误", f"添加失败：{e}")

@@ -19,6 +19,8 @@ from PySide6.QtGui import QMouseEvent
 from app.config import APP_TITLE, APP_VERSION
 from app import db
 from app import updater
+from app.netdisk import provider_label
+from app.core.scheduler import Scheduler
 from app.ui.icons import make_icon, make_pixmap
 from app.ui.pages.home import HomePage
 from app.ui.pages.auto_sync import AutoSyncPage
@@ -26,6 +28,7 @@ from app.ui.pages.batch_rename import BatchRenamePage
 from app.ui.pages.ad_insert import AdInsertPage
 from app.ui.pages.settings import SettingsPage
 from app.ui.pages.logs import LogsPage
+from app.ui.pages.friend_message import FriendMessagePage
 from app.ui.pages.placeholder import PlaceholderPage
 
 PRIMARY = "#2f6bff"
@@ -34,7 +37,7 @@ GRAY = "#5b6473"
 
 NAV = [
     ("home", "主页", "home"),
-    ("auto", "自动转存", "sync"),
+    ("auto", "自动同步", "sync"),
     ("rename", "批量重命名", "edit"),
     ("ad", "广告插入", "target"),
     ("friends", "好友消息", "users"),
@@ -174,7 +177,7 @@ class AccountChip(QFrame):
         n = db.account_count()
         if acc and acc.get("username"):
             self.name.setText(acc["username"])
-            self.sub.setText("当前账号 · 点击管理")
+            self.sub.setText(f"{provider_label(acc.get('provider'))} · 点击管理")
             self.avatar.setPixmap(make_pixmap("user", "#2f6bff", 18))
         else:
             self.name.setText("未登录")
@@ -299,9 +302,7 @@ class MainWindow(QWidget):
         self.auto = AutoSyncPage()
         self.rename = BatchRenamePage()
         self.ad_insert = AdInsertPage()
-        self.friends = PlaceholderPage(
-            "好友消息", "自动转存好友聊天发来的文件夹（开发中）"
-        )
+        self.friends = FriendMessagePage()
         self.logs = LogsPage()
         self.settings = SettingsPage()
         self.settings.account_changed.connect(self.on_account_changed)
@@ -320,6 +321,31 @@ class MainWindow(QWidget):
 
         self.navigate("home")
         self.sidebar.refresh_account()
+
+        # 后台定时调度器：自动跑到期的同步任务
+        self.scheduler = Scheduler()
+        self.scheduler.task_ran.connect(self._on_scheduled_task_ran)
+        self.scheduler.swept.connect(self._on_scheduler_swept)
+        self.scheduler.start()
+
+    def _on_scheduled_task_ran(self, task_id: int, result: dict):
+        # 定时任务跑完，刷新任务列表与日志（若正显示）
+        if self.stack.currentWidget() is self.auto:
+            self.auto.reload_tasks()
+        if self.stack.currentWidget() is self.logs:
+            self.logs.reload()
+
+    def _on_scheduler_swept(self):
+        if self.stack.currentWidget() is self.logs:
+            self.logs.reload()
+
+    def closeEvent(self, e):
+        try:
+            if hasattr(self, "scheduler"):
+                self.scheduler.stop()
+                self.scheduler.wait(3000)
+        finally:
+            super().closeEvent(e)
 
     def changeEvent(self, e):
         super().changeEvent(e)
@@ -460,6 +486,8 @@ class MainWindow(QWidget):
             self.rename.on_shown()
         if key == "ad":
             self.ad_insert.on_shown()
+        if key == "friends":
+            self.friends.on_shown()
         if key == "settings":
             self.settings.refresh_accounts()
 
@@ -468,6 +496,7 @@ class MainWindow(QWidget):
         self.auto.refresh_accounts()
         self.rename.refresh_accounts()
         self.ad_insert.refresh_accounts()
+        self.friends.refresh_accounts()
 
     # ---- 无边框窗口的原生边缘缩放（Windows）----
     RESIZE_MARGIN = 7

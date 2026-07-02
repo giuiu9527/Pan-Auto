@@ -24,6 +24,7 @@ from app.ui.rule_editor import RuleEditor
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.core import batch_rename
 from app.core.rename import apply_rules
+from app.netdisk import account_display_name
 from app import db
 
 
@@ -214,7 +215,7 @@ class BatchRenamePage(QWidget):
         self.account.blockSignals(True)
         self.account.clear()
         for acc in db.list_accounts():
-            self.account.addItem(acc["username"] or "百度用户", acc["id"])
+            self.account.addItem(account_display_name(acc), acc["id"])
         idx = self.account.findData(prev)
         if idx >= 0:
             self.account.setCurrentIndex(idx)

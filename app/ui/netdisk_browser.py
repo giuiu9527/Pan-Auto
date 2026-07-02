@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 
-from app.baidu.client import get_client_for_account
+from app.netdisk import get_client_for_account
+from app.quark.client import display_path, is_quark_path
 from app.ui.icons import make_icon
 
 
@@ -58,8 +59,12 @@ class NetdiskBrowser(QWidget):
     def __init__(self):
         super().__init__()
         self.cwd = "/"
+        self._history: list[str] = []
         self.account_id = None
-        self.worker: ListWorker | None = None
+        # 保留所有在跑的线程引用，直到它们 finished，避免 QThread 运行中被 GC
+        # 销毁（Qt 会 abort 进程）。_seq 用于只采纳最后一次加载的结果。
+        self._workers: list[ListWorker] = []
+        self._seq = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -95,25 +100,42 @@ class NetdiskBrowser(QWidget):
     def set_account(self, account_id):
         """切换浏览的账号并刷新到根目录。"""
         self.account_id = account_id
+        self._history.clear()
         self.load("/")
 
     def load(self, path: str = "/"):
         self.cwd = path or "/"
-        self.path_label.setText(self.cwd)
-        self.selected_changed.emit(self.cwd)
-        self.up_btn.setEnabled(self.cwd != "/")
+        shown = display_path(self.cwd)
+        self.path_label.setText(shown)
+        self.selected_changed.emit(shown)
+        self.up_btn.setEnabled(bool(self._history) or self.cwd != "/")
         self.list.clear()
         self.status.setText("加载中…")
         self.refresh_btn.setEnabled(False)
-        self.worker = ListWorker(self.cwd, self.account_id)
-        self.worker.done.connect(self._on_loaded)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
+        self._seq += 1
+        seq = self._seq
+        worker = ListWorker(self.cwd, self.account_id)
+        # 只采纳最后一次加载的结果，旧线程结果忽略但仍等它自然结束
+        worker.done.connect(lambda items, s=seq: s == self._seq and self._on_loaded(items))
+        worker.error.connect(lambda msg, s=seq: s == self._seq and self._on_error(msg))
+        worker.finished.connect(lambda w=worker: self._drop_worker(w))
+        self._workers.append(worker)
+        worker.start()
+
+    def _drop_worker(self, w):
+        if w in self._workers:
+            self._workers.remove(w)
 
     def reload(self):
         self.load(self.cwd)
 
     def go_up(self):
+        if self._history:
+            self.load(self._history.pop())
+            return
+        if is_quark_path(self.cwd):
+            self.load("/")
+            return
         if self.cwd == "/":
             return
         parent = self.cwd.rsplit("/", 1)[0] or "/"
@@ -140,17 +162,18 @@ class NetdiskBrowser(QWidget):
     def _on_error(self, msg: str):
         self.refresh_btn.setEnabled(True)
         if msg == "未登录":
-            self.status.setText("请先在「设置」中登录百度网盘")
+            self.status.setText("请先在「设置」中登录网盘账号")
         else:
             self.status.setText(f"加载失败：{msg}")
 
     def _on_double(self, item: QListWidgetItem):
         data = item.data(Qt.UserRole)
         if data and data.get("isdir"):
+            self._history.append(self.cwd)
             self.load(data["path"])
 
     def current_dir(self) -> str:
-        return self.cwd
+        return display_path(self.cwd)
 
     def selected_files(self) -> list[dict]:
         items = []

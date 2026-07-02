@@ -25,6 +25,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider    TEXT NOT NULL DEFAULT 'baidu',
                 username    TEXT,
                 cookies     TEXT,          -- JSON 字符串
                 bdstoken    TEXT,
@@ -74,10 +75,20 @@ def init_db() -> None:
                 ts          INTEGER,
                 UNIQUE(task_id, fs_key)
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key         TEXT PRIMARY KEY,
+                value       TEXT
+            );
             """
         )
         _migrate_single_account(c)
+        _ensure_column(c, "accounts", "provider", "TEXT NOT NULL DEFAULT 'baidu'")
         _ensure_column(c, "tasks", "account_id", "INTEGER")
+        # 好友/群同步任务：绑定的实体（好友 uk / 群 gid）+ 显示名 + 是否去广告
+        _ensure_column(c, "tasks", "entity_id", "TEXT")
+        _ensure_column(c, "tasks", "entity_name", "TEXT")
+        _ensure_column(c, "tasks", "ad_skip", "INTEGER NOT NULL DEFAULT 0")
         # 旧任务（无绑定账号）归到首个账号
         first = c.execute("SELECT id FROM accounts ORDER BY created_at LIMIT 1").fetchone()
         if first:
@@ -116,24 +127,32 @@ def _migrate_single_account(c) -> None:
 
 
 # ---- accounts ----
-def add_account(username: str, cookies: dict, bdstoken: str = "") -> int:
-    """新增或更新账号（按用户名去重）。首个账号自动设为活跃。"""
+def add_account(
+    username: str,
+    cookies: dict,
+    bdstoken: str = "",
+    provider: str = "baidu",
+) -> int:
+    """新增或更新账号（按网盘类型 + 用户名去重）。首个账号自动设为活跃。"""
+    provider = provider or "baidu"
     now = int(time.time())
     with get_conn() as c:
         existing = c.execute(
-            "SELECT id FROM accounts WHERE username=?", (username,)
+            "SELECT id FROM accounts WHERE provider=? AND username=?",
+            (provider, username),
         ).fetchone()
         if existing:
             c.execute(
-                "UPDATE accounts SET cookies=?, bdstoken=?, updated_at=? WHERE id=?",
-                (json.dumps(cookies), bdstoken, now, existing["id"]),
+                "UPDATE accounts SET cookies=?, bdstoken=?, updated_at=?, "
+                "provider=? WHERE id=?",
+                (json.dumps(cookies), bdstoken, now, provider, existing["id"]),
             )
             acc_id = existing["id"]
         else:
             cur = c.execute(
-                "INSERT INTO accounts(username, cookies, bdstoken, is_active, "
-                "created_at, updated_at) VALUES (?,?,?,0,?,?)",
-                (username, json.dumps(cookies), bdstoken, now, now),
+                "INSERT INTO accounts(provider, username, cookies, bdstoken, "
+                "is_active, created_at, updated_at) VALUES (?,?,?,?,0,?,?)",
+                (provider, username, json.dumps(cookies), bdstoken, now, now),
             )
             acc_id = cur.lastrowid
         # 若当前没有活跃账号，把它设为活跃
@@ -148,6 +167,7 @@ def add_account(username: str, cookies: dict, bdstoken: str = "") -> int:
 def _row_to_account(row) -> dict:
     return {
         "id": row["id"],
+        "provider": row["provider"] or "baidu",
         "username": row["username"],
         "cookies": json.loads(row["cookies"] or "{}"),
         "bdstoken": row["bdstoken"],
@@ -155,9 +175,15 @@ def _row_to_account(row) -> dict:
     }
 
 
-def list_accounts() -> list[dict]:
+def list_accounts(provider: str | None = None) -> list[dict]:
     with get_conn() as c:
-        rows = c.execute("SELECT * FROM accounts ORDER BY created_at").fetchall()
+        if provider:
+            rows = c.execute(
+                "SELECT * FROM accounts WHERE provider=? ORDER BY created_at",
+                (provider,),
+            ).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM accounts ORDER BY created_at").fetchall()
     return [_row_to_account(r) for r in rows]
 
 
@@ -197,8 +223,12 @@ def delete_account(account_id: int) -> None:
                 c.execute("UPDATE accounts SET is_active=1 WHERE id=?", (nxt["id"],))
 
 
-def account_count() -> int:
+def account_count(provider: str | None = None) -> int:
     with get_conn() as c:
+        if provider:
+            return c.execute(
+                "SELECT COUNT(*) n FROM accounts WHERE provider=?", (provider,)
+            ).fetchone()["n"]
         return c.execute("SELECT COUNT(*) n FROM accounts").fetchone()["n"]
 
 
@@ -207,7 +237,8 @@ def add_task(data: dict) -> int:
     with get_conn() as c:
         cur = c.execute(
             "INSERT INTO tasks(account_id, kind, link, pwd, target_dir, interval, "
-            "rename_on, note, enabled, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "rename_on, note, enabled, entity_id, entity_name, ad_skip, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 data.get("account_id"),
                 data.get("kind", "share"),
@@ -218,6 +249,9 @@ def add_task(data: dict) -> int:
                 int(data.get("rename_on", 0)),
                 data.get("note", ""),
                 int(data.get("enabled", 1)),
+                data.get("entity_id"),
+                data.get("entity_name"),
+                int(data.get("ad_skip", 0)),
                 int(time.time()),
             ),
         )
@@ -227,7 +261,7 @@ def add_task(data: dict) -> int:
 def list_tasks() -> list[dict]:
     with get_conn() as c:
         rows = c.execute(
-            "SELECT t.*, a.username AS account_name "
+            "SELECT t.*, a.username AS account_name, a.provider AS account_provider "
             "FROM tasks t LEFT JOIN accounts a ON t.account_id=a.id "
             "ORDER BY t.created_at DESC"
         ).fetchall()
@@ -237,7 +271,7 @@ def list_tasks() -> list[dict]:
 def get_task(task_id: int) -> Optional[dict]:
     with get_conn() as c:
         row = c.execute(
-            "SELECT t.*, a.username AS account_name "
+            "SELECT t.*, a.username AS account_name, a.provider AS account_provider "
             "FROM tasks t LEFT JOIN accounts a ON t.account_id=a.id WHERE t.id=?",
             (task_id,),
         ).fetchone()
@@ -248,7 +282,8 @@ def update_task(task_id: int, data: dict) -> None:
     with get_conn() as c:
         c.execute(
             "UPDATE tasks SET account_id=?, link=?, pwd=?, target_dir=?, "
-            "interval=?, rename_on=?, note=? WHERE id=?",
+            "interval=?, rename_on=?, note=?, entity_id=?, entity_name=?, ad_skip=? "
+            "WHERE id=?",
             (
                 data.get("account_id"),
                 data.get("link", ""),
@@ -257,6 +292,9 @@ def update_task(task_id: int, data: dict) -> None:
                 data.get("interval", "daily"),
                 int(data.get("rename_on", 0)),
                 data.get("note", ""),
+                data.get("entity_id"),
+                data.get("entity_name"),
+                int(data.get("ad_skip", 0)),
                 task_id,
             ),
         )
@@ -341,4 +379,32 @@ def mark_transferred(task_id: int, fs_key: str, name: str) -> None:
             "INSERT OR IGNORE INTO transferred(task_id, fs_key, name, ts) "
             "VALUES (?,?,?,?)",
             (task_id, fs_key, name, int(time.time())),
+        )
+
+
+def set_task_last_run(task_id: int, ts: Optional[int] = None) -> None:
+    if task_id is None:
+        return
+    with get_conn() as c:
+        c.execute(
+            "UPDATE tasks SET last_run=? WHERE id=?",
+            (int(ts if ts is not None else time.time()), task_id),
+        )
+
+
+# ---- app settings（键值）----
+def get_setting(key: str, default: str = "") -> str:
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT value FROM app_settings WHERE key=?", (key,)
+        ).fetchone()
+    return row["value"] if row and row["value"] is not None else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO app_settings(key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
         )

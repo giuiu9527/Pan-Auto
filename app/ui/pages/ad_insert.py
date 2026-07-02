@@ -347,7 +347,7 @@ class AdInsertPage(QWidget):
         prev = self.account.currentData()
         self.account.blockSignals(True)
         self.account.clear()
-        for acc in db.list_accounts():
+        for acc in db.list_accounts("baidu"):
             self.account.addItem(acc["username"] or "百度用户", acc["id"])
         idx = self.account.findData(prev)
         if idx >= 0:

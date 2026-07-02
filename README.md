@@ -52,12 +52,14 @@ PAN_AUTO_GITHUB_TOKEN=你的临时访问令牌
 - ✅ 运行日志页
 - ✅ Git 私有库半热更新（拉取更新后重启生效）
 - ✅ 打包版 GitHub Releases 更新与强制更新策略
+- ✅ 夸克网盘账号管理与目录浏览（Cookie 登录态）
 
 ## 待实现
 
 - ⏳ Phase 2：分享链接转存的真实接口对接（解析→验证提取码→列文件→转存）
 - ⏳ Phase 3：好友消息文件夹自动转存
 - ⏳ Phase 4：APScheduler 定时调度 + 系统托盘 + PyInstaller 打包 exe
+- ⏳ Phase 5：夸克网盘分享转存、复制、重命名等完整业务接口
 
 ## 数据位置
 

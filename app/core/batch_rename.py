@@ -2,15 +2,11 @@
 import time
 from typing import Callable, Optional
 
-from app.baidu.client import get_client_for_account
+from app.netdisk import get_client_for_account
 from app.core.rename import apply_rules
 from app import db
 
 LogFn = Callable[[str, str], None]
-
-
-def _join(folder: str, name: str) -> str:
-    return (folder.rstrip("/") + "/" + name) if folder != "/" else "/" + name
 
 
 def list_folder(account_id: int, folder: str) -> list[dict]:
@@ -58,13 +54,13 @@ def run_rename(
         if not new or new == old:
             continue
         try:
-            res = client.rename(_join(folder, old), new)
-            if res.get("errno") in (0, None):
+            res = client.rename_item(it, new)
+            if not res.get("error"):
                 renamed += 1
                 emit("ok", f"改名：{old} → {new}")
             else:
                 errors += 1
-                emit("error", f"改名失败({res.get('errno')})：{old}")
+                emit("error", f"改名失败：{old}：{res['error']}")
         except Exception as e:  # noqa: BLE001
             errors += 1
             emit("error", f"改名异常：{old}：{e}")

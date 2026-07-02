@@ -1,0 +1,1 @@
+"""Quark netdisk integration."""

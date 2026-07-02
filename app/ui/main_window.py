@@ -12,11 +12,19 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QMessageBox,
+    QProgressDialog,
 )
 from PySide6.QtCore import Qt, QPoint, QSize, QEvent, QThread, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QMouseEvent, QIcon
 
 from app.config import APP_TITLE, APP_VERSION
+
+import os as _os
+import sys as _sys
+if getattr(_sys, 'frozen', False):
+    _ICON_PATH = _os.path.join(_os.path.dirname(_sys.executable), 'app', 'ui', 'assets', 'app.ico')
+else:
+    _ICON_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'assets', 'app.ico')
 from app import db
 from app import updater
 from app.netdisk import provider_label
@@ -243,9 +251,30 @@ class UpdateCheckWorker(QThread):
 
 class UpdateApplyWorker(QThread):
     done = Signal(dict)
+    progress = Signal(int, int)  # downloaded, total
 
     def run(self):
-        self.done.emit(updater.apply_update())
+        # Release 更新时带进度回调
+        if getattr(_sys, 'frozen', False) or not updater.is_git_repo():
+            state = updater.check_release_update()
+            if not state.get('ok') or not state.get('has_update'):
+                self.done.emit(updater.apply_update())
+                return
+            if _sys.platform != 'win32':
+                self.done.emit({'ok': False, 'code': 'unsupported_platform', 'message': '打包版自动替换目前仅支持 Windows'})
+                return
+            from pathlib import Path
+            ok, zip_path_or_msg = updater.download_release_asset(state, progress_cb=lambda d, t: self.progress.emit(d, t))
+            if not ok:
+                self.done.emit({**state, 'ok': False, 'code': 'download_failed', 'message': zip_path_or_msg})
+                return
+            ok, msg = updater.launch_windows_replacer(Path(zip_path_or_msg))
+            if not ok:
+                self.done.emit({**state, 'ok': False, 'code': 'replace_failed', 'message': msg})
+                return
+            self.done.emit({**state, 'updated': True, 'restart_managed': True, 'downloaded_path': str(zip_path_or_msg), 'message': '更新包已下载，关闭软件后将自动替换并重启'})
+        else:
+            self.done.emit(updater.apply_update())
 
 
 class StatusBar(QWidget):
@@ -276,6 +305,8 @@ class MainWindow(QWidget):
         self.setWindowFlag(Qt.FramelessWindowHint)
         self.resize(1120, 740)
         self.setMinimumSize(940, 620)
+        if _os.path.exists(_ICON_PATH):
+            self.setWindowIcon(QIcon(_ICON_PATH))
         self._update_workers = []
         self._force_update_required = False
 
@@ -439,13 +470,45 @@ class MainWindow(QWidget):
     def _apply_update(self):
         if any(isinstance(w, UpdateApplyWorker) for w in self._update_workers):
             return
+
+        # 创建进度对话框
+        self._progress_dlg = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        self._progress_dlg.setWindowTitle("下载更新")
+        self._progress_dlg.setWindowModality(Qt.WindowModal)
+        self._progress_dlg.setMinimumWidth(380)
+        self._progress_dlg.setAutoClose(False)
+        self._progress_dlg.setAutoReset(False)
+        self._progress_dlg.setValue(0)
+        self._progress_dlg.show()
+
         worker = UpdateApplyWorker()
+        worker.progress.connect(self._on_download_progress)
         worker.done.connect(self._on_update_applied)
         worker.finished.connect(lambda w=worker: self._update_workers.remove(w))
         self._update_workers.append(worker)
+        self._progress_dlg.canceled.connect(lambda: worker.terminate())
         worker.start()
 
+    def _on_download_progress(self, downloaded: int, total: int):
+        dlg = getattr(self, '_progress_dlg', None)
+        if not dlg:
+            return
+        if total > 0:
+            pct = int(downloaded * 100 / total)
+            dlg.setValue(pct)
+            mb_down = downloaded / 1024 / 1024
+            mb_total = total / 1024 / 1024
+            dlg.setLabelText(f"正在下载更新... {mb_down:.1f} / {mb_total:.1f} MB")
+        else:
+            mb_down = downloaded / 1024 / 1024
+            dlg.setLabelText(f"正在下载更新... {mb_down:.1f} MB")
+
     def _on_update_applied(self, result: dict):
+        dlg = getattr(self, '_progress_dlg', None)
+        if dlg:
+            dlg.close()
+            self._progress_dlg = None
+
         if not result.get("ok"):
             QMessageBox.warning(self, "更新失败", result.get("message", "未知错误"))
             if self._force_update_required:

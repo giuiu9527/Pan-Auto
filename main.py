@@ -15,6 +15,11 @@ def main() -> int:
     if "--baidu-login" in sys.argv:
         return _run_login()
 
+    # Windows：设置 AppUserModelID 让任务栏显示自定义图标
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PanAuto.App")
+
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QFont

@@ -352,7 +352,8 @@ def apply_release_update() -> dict:
     }
 
 
-def download_release_asset(state: dict) -> tuple[bool, str]:
+def download_release_asset(state: dict, progress_cb=None) -> tuple[bool, str]:
+    """下载更新包。progress_cb(downloaded_bytes, total_bytes) 用于报告进度。"""
     updates_dir = DATA_DIR / "updates"
     updates_dir.mkdir(parents=True, exist_ok=True)
     asset_name = state.get("asset_name") or f"Pan-Auto-{state.get('tag_name', 'latest')}-windows-x64.zip"
@@ -372,7 +373,16 @@ def download_release_asset(state: dict) -> tuple[bool, str]:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=300) as r, target.open("wb") as f:
-                shutil.copyfileobj(r, f)
+                total = int(r.headers.get("Content-Length", 0) or 0)
+                downloaded = 0
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb:
+                        progress_cb(downloaded, total)
             if target.exists() and target.stat().st_size > 0:
                 return True, str(target)
             errors.append("下载内容为空")

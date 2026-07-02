@@ -20,7 +20,6 @@ from app.ui.netdisk_browser import NetdiskBrowser
 from app.baidu.client import BaiduPanClient
 from app.quark.client import QuarkPanClient, parse_quark_cookie
 from app.netdisk import provider_label
-from app.core.transfer import DEFAULT_AD_KEYWORDS
 from app import db
 
 
@@ -158,35 +157,9 @@ class SettingsPage(QWidget):
         cl.addWidget(self.browser, 1)
         body.addWidget(ck_card, 2)
 
-        # 广告关键词（好友/群定时同步时用于过滤广告垃圾文件）
-        ad_card = card()
-        al = QVBoxLayout(ad_card)
-        al.setContentsMargins(16, 12, 16, 12)
-        al.setSpacing(6)
-        al.addWidget(field_label("广告关键词（过滤好友/群同步的垃圾文件）"))
-        al.addWidget(
-            label("文件名命中任一关键词就不转存；一行一个或用逗号分隔。", "Muted")
-        )
-        self.ad_input = QPlainTextEdit()
-        self.ad_input.setMaximumHeight(90)
-        self.ad_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
-        al.addWidget(self.ad_input)
-        ad_btn_row = QHBoxLayout()
-        ad_btn_row.addStretch()
-        save_ad = QPushButton("保存广告关键词")
-        save_ad.setObjectName("Ghost")
-        save_ad.clicked.connect(self.save_ad_keywords)
-        ad_btn_row.addWidget(save_ad)
-        al.addLayout(ad_btn_row)
-        root.addWidget(ad_card)
-
         self._refresh_provider_text()
         self.refresh_accounts()
         self.refresh_browser()
-
-    def save_ad_keywords(self):
-        db.set_setting("ad_keywords", self.ad_input.toPlainText().strip())
-        QMessageBox.information(self, "已保存", "广告关键词已更新，下次同步生效。")
 
     def set_provider(self, provider: str):
         self.provider = provider

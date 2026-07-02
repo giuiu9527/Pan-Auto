@@ -41,8 +41,7 @@ class BaiduPanClient:
             params={"fields": '["bdstoken","username"]'},
             timeout=15,
         )
-        data = r.json()
-        self._bdstoken = data.get("result", {}).get("bdstoken", "")
+        self._bdstoken = _result_dict(r.json()).get("bdstoken", "")
         return self._bdstoken
 
     def get_user_info(self) -> dict:
@@ -51,7 +50,7 @@ class BaiduPanClient:
             params={"fields": '["bdstoken","username","loginstate"]'},
             timeout=15,
         )
-        result = r.json().get("result", {})
+        result = _result_dict(r.json())
         return {
             "username": result.get("username", ""),
             "bdstoken": result.get("bdstoken", ""),
@@ -136,6 +135,27 @@ class BaiduPanClient:
                 "onnest": "fail",
             },
             data={"filelist": json.dumps(filelist, ensure_ascii=False)},
+            timeout=30,
+        )
+        return r.json()
+
+    def delete_files(self, paths: list[str]) -> dict:
+        """删除网盘内文件/文件夹（path 为完整路径）。"""
+        bd = self.get_bdstoken()
+        r = self.s.post(
+            "https://pan.baidu.com/api/filemanager",
+            params={
+                "opera": "delete",
+                "async": 2,
+                "bdstoken": bd,
+                "onnest": "fail",
+                "channel": "chunlei",
+                "web": 1,
+                "clienttype": 0,
+                "app_id": 250528,
+            },
+            data={"filelist": json.dumps(paths, ensure_ascii=False)},
+            headers={"Referer": "https://pan.baidu.com/disk/home"},
             timeout=30,
         )
         return r.json()
@@ -539,6 +559,15 @@ def _join_path(target_dir: str, name: str) -> str:
     if target_dir.endswith("/"):
         return target_dir + name
     return target_dir + "/" + name
+
+
+def _result_dict(data) -> dict:
+    """取百度接口的 result 字段。未登录时百度返回 result:[]（list），需兜底成 {}。"""
+    if isinstance(data, dict):
+        res = data.get("result")
+        if isinstance(res, dict):
+            return res
+    return {}
 
 
 def _first(text: str, pattern: str) -> str:

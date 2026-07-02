@@ -225,6 +225,25 @@ class QuarkPanClient:
             return {"error": "缺少文件 fid"}
         return self.rename_by_fid(str(fid), newname)
 
+    def delete_files(self, fids: list[str]) -> dict:
+        """删除文件/文件夹（fids 为文件 fid 列表）。"""
+        r = self.s.post(
+            f"{API}/file/delete",
+            params=COMMON,
+            json={"action_type": 2, "filelist": [str(x) for x in fids], "exclude_fids": []},
+            timeout=20,
+        )
+        d = r.json()
+        if not _is_ok(d):
+            return {"errno": d.get("code") or -1, "message": _msg(d, "删除失败")}
+        task_id = (d.get("data") or {}).get("task_id") or ""
+        if task_id:
+            try:
+                self._wait_task(task_id)
+            except Exception as e:  # noqa: BLE001
+                return {"errno": -1, "message": str(e)}
+        return {"errno": 0}
+
     def rename_in_dir(self, target_fid: str, old_name: str, new_name: str) -> None:
         """转存后按文件名定位 fid 改名（转存自动改名用）。"""
         cache = self._dir_cache.get(target_fid)

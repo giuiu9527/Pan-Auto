@@ -1,7 +1,7 @@
-## Pan-Auto V1.0
+## Pan-Auto V1.1
 
-- 体积大幅瘦身：**556MB → 127MB**（移除内置 Chromium/QtWebEngine）
-- 登录改用系统 Edge WebView2（不再打包浏览器内核）
-- 缺少 WebView2 运行时时弹窗引导下载；始终可用「Cookie 添加」兜底
+- 修复：浏览器登录报「'list' object has no attribute 'get'」的崩溃
+- 优化：登录抓到 Cookie 后先校验登录态，避免拿到半截无效 Cookie
+- 新增：「广告清理」独立页——扫描文件夹里的广告文件并批量删除（关键词配置也移到这里）
 
 自动更新：旧版本点「检查更新」即可升级到本版。

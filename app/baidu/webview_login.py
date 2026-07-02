@@ -15,6 +15,36 @@ import time
 LOGIN_URL = "https://pan.baidu.com/"
 RESULT_PREFIX = "PANAUTO_RESULT:"
 WEBVIEW2_DOWNLOAD = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"  # Evergreen 引导安装器
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def _verify_login(cookies: dict) -> str:
+    """用抓到的 Cookie 调百度接口校验登录态，返回用户名（无效则空串）。
+
+    百度未登录时返回 {"errno":-6,"result":[]}，所以只有 result 是 dict 且有
+    username 才算真正登录成功——避免抓取时机太早拿到半截 Cookie。
+    """
+    try:
+        import requests
+
+        s = requests.Session()
+        s.headers.update({"User-Agent": _UA, "Referer": LOGIN_URL})
+        s.cookies.update(cookies)
+        r = s.get(
+            "https://pan.baidu.com/api/gettemplatevariable",
+            params={"fields": '["username"]'},
+            timeout=10,
+        )
+        d = r.json()
+        res = d.get("result") if isinstance(d, dict) else None
+        if isinstance(res, dict):
+            return res.get("username") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def webview2_installed() -> bool:
@@ -97,10 +127,14 @@ def run() -> int:
                 except Exception:  # noqa: BLE001
                     # 窗口被关闭等
                     break
-                if "BDUSS" in cookies and cookies.get("BDUSS"):
-                    result["ok"] = True
-                    result["cookies"] = cookies
-                    break
+                if cookies.get("BDUSS"):
+                    # BDUSS 出现后再校验登录态；未通过说明登录态还没建好，继续等
+                    username = _verify_login(cookies)
+                    if username:
+                        result["ok"] = True
+                        result["cookies"] = cookies
+                        result["username"] = username
+                        break
         except Exception as e:  # noqa: BLE001
             result["error"] = str(e)
         finally:

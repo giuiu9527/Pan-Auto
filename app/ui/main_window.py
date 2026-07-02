@@ -26,6 +26,7 @@ from app.ui.pages.home import HomePage
 from app.ui.pages.auto_sync import AutoSyncPage
 from app.ui.pages.batch_rename import BatchRenamePage
 from app.ui.pages.ad_insert import AdInsertPage
+from app.ui.pages.ad_clean import AdCleanPage
 from app.ui.pages.settings import SettingsPage
 from app.ui.pages.logs import LogsPage
 from app.ui.pages.friend_message import FriendMessagePage
@@ -39,6 +40,7 @@ NAV = [
     ("home", "主页", "home"),
     ("auto", "自动同步", "sync"),
     ("rename", "批量重命名", "edit"),
+    ("adclean", "广告清理", "trash"),
     ("ad", "广告插入", "target"),
     ("friends", "好友消息", "users"),
     ("logs", "转存记录", "logs"),
@@ -301,6 +303,7 @@ class MainWindow(QWidget):
         self.home.navigate.connect(self.navigate)
         self.auto = AutoSyncPage()
         self.rename = BatchRenamePage()
+        self.adclean = AdCleanPage()
         self.ad_insert = AdInsertPage()
         self.friends = FriendMessagePage()
         self.logs = LogsPage()
@@ -311,6 +314,7 @@ class MainWindow(QWidget):
             "home": self.home,
             "auto": self.auto,
             "rename": self.rename,
+            "adclean": self.adclean,
             "ad": self.ad_insert,
             "friends": self.friends,
             "logs": self.logs,
@@ -484,6 +488,8 @@ class MainWindow(QWidget):
             self.auto.on_shown()
         if key == "rename":
             self.rename.on_shown()
+        if key == "adclean":
+            self.adclean.on_shown()
         if key == "ad":
             self.ad_insert.on_shown()
         if key == "friends":
@@ -495,6 +501,7 @@ class MainWindow(QWidget):
         self.sidebar.refresh_account()
         self.auto.refresh_accounts()
         self.rename.refresh_accounts()
+        self.adclean.refresh_accounts()
         self.ad_insert.refresh_accounts()
         self.friends.refresh_accounts()
 

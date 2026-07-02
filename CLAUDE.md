@@ -140,6 +140,9 @@ app/ui/
 3. **中文终端编码**：探测脚本打印中文用 `.encode("utf-8","ignore").decode()`，否则 GBK 报 `UnicodeEncodeError`。
 4. **接口抓包神器**：Claude Code 的 chrome-devtools MCP 连的浏览器**登录着用户的百度账号**。发现新接口的方法：`navigate` 到 `pan.baidu.com/disk/main#/im/session` → 点群 → 点「文件库」→ `evaluate_script` 注入 `window.fetch`/`XHR.open` 记录器 → 交互 → 读 `window.__reqs`。`mbox/msg/shareinfo` 就是这么抓到的。
 5. **列目录项字段**：百度 `list_dir` 项有 `server_filename fs_id isdir path size`；夸克 `list_dir` 归一成同样的键 + `fid` + `quark://` 路径。
+6. **百度 `result` 可能是 list**：未登录时 `gettemplatevariable` 返回 `{"errno":-6,"result":[]}`——`result` 是**空 list 不是 dict**。取前必须判类型（见 `baidu/client._result_dict`），否则 `result.get(...)` 抛 `'list' object has no attribute 'get'`。
+7. **WebView2 登录**（`baidu/webview_login.py`，子进程）：`pywebview.get_cookies()` 返回 **list of `SimpleCookie`**（dict 子类，键=cookie名、值=Morsel）——见 `_flatten_cookies`。**BDUSS 出现 ≠ 登录态建好**，必须用接口 `_verify_login` 校验拿到 username 才算成功，否则会抓到半截无效 Cookie。缺 WebView2 运行时查注册表 `webview2_installed()`，弹窗引导下载。
+8. **PowerShell 5.1 读中文文件必须显式 UTF-8**：`Get-Content -Raw` 默认按 GBK 解码，读 UTF-8 中文文件会乱码；若再写回就**毁掉文件**。用 `[IO.File]::ReadAllText($p,(New-Object System.Text.UTF8Encoding($false)))`。`release.ps1` 曾因此把 `config.py` 读乱写坏（已修，见其 `Read-Utf8`）。.ps1 脚本本身也要存成 **UTF-8 BOM**，否则 PS5.1 按 GBK 读脚本里的中文会解析报错。
 
 ---
 
@@ -150,8 +153,9 @@ app/ui/
 | 自动同步 | `pages/auto_sync.py` | ★分享同步/群组同步双 Tab + 右侧统一任务列表(可编辑)。群 Tab 用 `group_picker` 选群文件夹 |
 | 好友消息 | `pages/friend_message.py` | 好友/群手动浏览转存（树可展开进多级文件夹）+ 该实体的定时同步任务 |
 | 批量重命名 | `pages/batch_rename.py` | 选账号+文件夹+关键词规则，预览/执行 |
+| 广告清理 | `pages/ad_clean.py` | 递归扫描文件夹里命中广告关键词的文件 → 勾选删除 + **广告关键词配置**（`client.delete_files`）|
 | 广告插入 | `pages/ad_insert.py` | 复制广告文件到多个文件夹（**仅百度**） |
-| 设置 | `pages/settings.py` | 多账号管理、Cookie 添加、**广告关键词配置** |
+| 设置 | `pages/settings.py` | 多账号管理、Cookie 添加、浏览器登录（WebView2） |
 | 转存记录 | `pages/logs.py` | 日志 |
 
 - `netdisk_browser.NetdiskBrowser`：账号中立文件浏览器，多页复用。

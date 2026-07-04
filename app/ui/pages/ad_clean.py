@@ -54,11 +54,12 @@ class ScanWorker(QThread):
     done = Signal(list)
     error = Signal(str)
 
-    def __init__(self, account_id, folder, keywords, recursive):
+    def __init__(self, account_id, folder, keywords, recursive, whitelist=None):
         super().__init__()
         self.account_id = account_id
         self.folder = folder
         self.keywords = [k.lower() for k in keywords]
+        self.whitelist = [w.lower() for w in (whitelist or [])]
         self.recursive = recursive
 
     def run(self):
@@ -82,6 +83,8 @@ class ScanWorker(QThread):
                         continue
                     name = it.get("server_filename", "")
                     low = name.lower()
+                    if any(w in low for w in self.whitelist):
+                        continue  # 白名单：保留，不清理
                     if any(k in low for k in self.keywords):
                         matched.append(
                             {
@@ -187,9 +190,18 @@ class AdCleanPage(QWidget):
         fl.addWidget(label("一行一个或用逗号分隔；与「自动同步」的去广告共用。", "Muted"))
         self.kw_input = QPlainTextEdit()
         self.kw_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
-        self.kw_input.setMaximumHeight(120)
+        self.kw_input.setMaximumHeight(110)
         fl.addWidget(self.kw_input)
-        save_kw = QPushButton("保存关键词")
+
+        fl.addWidget(field_label("白名单关键词（命中则保留，绝不清理）"))
+        fl.addWidget(label("保护你自己插入的广告：文件名含这些词就不删、不跳过。", "Muted"))
+        self.wl_input = QPlainTextEdit()
+        self.wl_input.setPlainText(db.get_setting("ad_whitelist", ""))
+        self.wl_input.setMaximumHeight(80)
+        self.wl_input.setPlaceholderText("如：我的公众号名、你的推广品牌…")
+        fl.addWidget(self.wl_input)
+
+        save_kw = QPushButton("保存关键词/白名单")
         save_kw.setObjectName("Ghost")
         save_kw.clicked.connect(self.save_keywords)
         kwrow = QHBoxLayout()
@@ -309,7 +321,10 @@ class AdCleanPage(QWidget):
 
     def save_keywords(self):
         db.set_setting("ad_keywords", self.kw_input.toPlainText().strip())
-        QMessageBox.information(self, "已保存", "广告关键词已更新（自动同步的去广告也会用）。")
+        db.set_setting("ad_whitelist", self.wl_input.toPlainText().strip())
+        QMessageBox.information(
+            self, "已保存", "广告关键词与白名单已更新（自动同步的去广告也会用）。"
+        )
 
     # ---- 目录选择 ----
     def pick_folder(self):
@@ -336,11 +351,13 @@ class AdCleanPage(QWidget):
             QMessageBox.warning(self, "提示", "请先填写广告关键词")
             return
         db.set_setting("ad_keywords", self.kw_input.toPlainText().strip())
+        db.set_setting("ad_whitelist", self.wl_input.toPlainText().strip())
+        wl = _parse_keywords(self.wl_input.toPlainText())
         self.right_stack.setCurrentIndex(0)
         self.table.setRowCount(0)
         self.scan_btn.setEnabled(False)
         self.status.setText("扫描中…")
-        w = ScanWorker(acc_id, self.folder_edit.text().strip() or "/", kws, self.recursive.isChecked())
+        w = ScanWorker(acc_id, self.folder_edit.text().strip() or "/", kws, self.recursive.isChecked(), wl)
         w.progress.connect(self.status.setText)
         w.done.connect(self._on_scanned)
         w.error.connect(self._on_scan_error)

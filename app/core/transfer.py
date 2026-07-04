@@ -92,9 +92,22 @@ def ad_keywords() -> list[str]:
     return [k.strip() for k in re.split(r"[\n,，]", raw) if k.strip()]
 
 
+def ad_whitelist() -> list[str]:
+    """白名单关键词：文件名命中则永不清理/跳过（保护自己插入的广告等）。"""
+    raw = db.get_setting("ad_whitelist", "")
+    return [k.strip() for k in re.split(r"[\n,，]", raw) if k.strip()]
+
+
 def _is_ad(name: str, keywords: list[str]) -> bool:
     low = (name or "").lower()
     return any(k.lower() in low for k in keywords)
+
+
+def is_ad_to_remove(name: str, ad_kw: list[str], whitelist: list[str]) -> bool:
+    """是否应作为广告清理/跳过：命中广告词、且未命中白名单。"""
+    if whitelist and _is_ad(name, whitelist):
+        return False
+    return _is_ad(name, ad_kw)
 
 
 def _folder_ref(link) -> Optional[dict]:
@@ -168,6 +181,7 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
         return _result(error=str(e))
 
     ad_kw = ad_keywords() if task.get("ad_skip") else []
+    ad_wl = ad_whitelist() if task.get("ad_skip") else []
     rules = db.list_rules(None) if task.get("rename_on") else []
 
     # 去重 + 去广告
@@ -178,7 +192,7 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
         if db.is_transferred(task_id, fs_key):
             skipped += 1
             continue
-        if ad_kw and _is_ad(f["server_filename"], ad_kw):
+        if ad_kw and is_ad_to_remove(f["server_filename"], ad_kw, ad_wl):
             db.mark_transferred(task_id, fs_key, f["server_filename"])  # 记下不再处理
             skipped += 1
             continue
@@ -259,6 +273,7 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
         return _result(error=str(e))
 
     ad_kw = ad_keywords() if task.get("ad_skip") else []
+    ad_wl = ad_whitelist() if task.get("ad_skip") else []
     rules = db.list_rules(None) if task.get("rename_on") else []
 
     transferred = 0
@@ -273,7 +288,7 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
             if db.is_transferred(task_id, fs_key):
                 skipped += 1
                 continue
-            if ad_kw and _is_ad(f["server_filename"], ad_kw):
+            if ad_kw and is_ad_to_remove(f["server_filename"], ad_kw, ad_wl):
                 db.mark_transferred(task_id, fs_key, f["server_filename"])
                 skipped += 1
                 continue

@@ -382,6 +382,16 @@ def mark_transferred(task_id: int, fs_key: str, name: str) -> None:
         )
 
 
+def clear_transferred(task_id: int) -> int:
+    """清除某任务的去重记录，返回清除条数（用于重新全量同步）。"""
+    with get_conn() as c:
+        n = c.execute(
+            "SELECT COUNT(*) n FROM transferred WHERE task_id=?", (task_id,)
+        ).fetchone()["n"]
+        c.execute("DELETE FROM transferred WHERE task_id=?", (task_id,))
+    return n
+
+
 def set_task_last_run(task_id: int, ts: Optional[int] = None) -> None:
     if task_id is None:
         return

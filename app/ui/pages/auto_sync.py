@@ -508,8 +508,10 @@ class AutoSyncPage(QWidget):
             ol.setContentsMargins(4, 0, 4, 0)
             ol.setSpacing(3)
             ol.setAlignment(Qt.AlignVCenter)
-            run_b = _icon_btn("play", "#2f6bff", "立即同步")
+            run_b = _icon_btn("play", "#2f6bff", "立即同步（增量，只转新增）")
             run_b.clicked.connect(lambda _=False, tt=dict(t): self.run_now(tt))
+            resync_b = _icon_btn("sync", "#e67e22", "重新同步（清去重记录后全量重转，用于你删过目标文件想重新拉回）")
+            resync_b.clicked.connect(lambda _=False, tt=dict(t): self.resync_now(tt))
             edit_b = _icon_btn("edit", "#334155", "编辑")
             edit_b.clicked.connect(lambda _=False, tt=dict(t): self.load_for_edit(tt))
             toggle_b = _icon_btn(
@@ -522,7 +524,7 @@ class AutoSyncPage(QWidget):
             )
             del_b = _icon_btn("trash", "#e5484d", "删除")
             del_b.clicked.connect(lambda _=False, tid=t["id"]: self.on_delete(tid))
-            for b in (run_b, edit_b, toggle_b, del_b):
+            for b in (run_b, resync_b, edit_b, toggle_b, del_b):
                 ol.addWidget(b)
             self.table.setCellWidget(r, 5, ops)
 
@@ -545,6 +547,21 @@ class AutoSyncPage(QWidget):
             if self.editing_id == task_id:
                 self.reset_form()
             self.reload_tasks()
+
+    def resync_now(self, task: dict):
+        if task.get("account_id") is None or db.get_account(task["account_id"]) is None:
+            QMessageBox.warning(self, "账号不可用", "该任务绑定的账号已删除，请重建任务")
+            return
+        if QMessageBox.question(
+            self,
+            "重新同步",
+            "将清除该任务的「已转记录」并重新转存全部文件。\n"
+            "适用于：你在网盘里删了之前同步的文件，想重新拉回来。\n\n确定？",
+        ) != QMessageBox.Yes:
+            return
+        n = db.clear_transferred(task["id"])
+        db.add_log("info", f"重新同步「{task.get('note') or task.get('entity_name') or ''}」：已清除 {n} 条去重记录", task["id"])
+        self.run_now(task)
 
     def run_now(self, task: dict):
         if task.get("account_id") is None or db.get_account(task["account_id"]) is None:

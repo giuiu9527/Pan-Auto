@@ -20,6 +20,7 @@ LogFn = Callable[[str, str], None]
 
 # 各间隔对应的秒数，供调度器判断任务是否到期
 INTERVAL_SECONDS = {
+    "1m": 60,
     "30m": 30 * 60,
     "hourly": 60 * 60,
     "6h": 6 * 60 * 60,
@@ -125,6 +126,33 @@ def _folder_ref(link) -> Optional[dict]:
             "from_uk": str(d.get("from_uk", "")),
         }
     return None
+
+
+def _enumerate_leaf_deep(
+    client, from_uk, msg_id, gid, direct, max_calls=800, max_items=8000
+):
+    """递归枚举叶子文件夹下**所有层级**的项（文件+文件夹），供深层增量检测。
+
+    只列一层的话，「已存在子文件夹内部新增的深层文件」永远发现不了；这里逐层深入，
+    这样在文件夹 3 里新增的 ppt/mp4 也能被增量识别并同步。
+    - `direct`：已列好的叶子直接子项，避免重复调用。
+    - 防爆上限：调用次数/项数超限即停（超大目录退化为不完全枚举，已发现的新项仍会同步）。
+    """
+    out = list(direct)
+    stack = [it for it in direct if it.get("isdir")]
+    calls = 0
+    while stack and calls < max_calls and len(out) < max_items:
+        it = stack.pop()
+        calls += 1
+        try:
+            kids = client.list_msg_folder(from_uk, msg_id, it["fs_id"], gid)
+        except Exception:  # noqa: BLE001
+            continue
+        for k in kids:
+            out.append(k)
+            if k.get("isdir"):
+                stack.append(k)
+    return out
 
 
 # ---- 分发入口 ----
@@ -246,6 +274,8 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
         emit("error", f"[{name_tag}] 任务未绑定好友/群")
         return _result(error="未绑定好友/群")
 
+    # 群"具体文件夹"任务：转存后要去掉百度自动重建的外层壳，落到叶子文件夹本身
+    leaf_rel = ""
     try:
         if kind == "friend":
             messages = client.list_friend_files(entity)
@@ -253,11 +283,21 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
             # 群任务：link 里可能带"具体文件夹"引用，只同步该文件夹；否则整群
             ref = _folder_ref(task.get("link"))
             if ref:
-                children = client.list_msg_folder(
+                direct = client.list_msg_folder(
                     ref["from_uk"], ref["msg_id"], ref["fs_id"], entity
                 )
+                # 直接子项的 path 去掉自身名即叶子文件夹路径（用于中转后定位叶子）
+                for ch in direct:
+                    p = ch.get("path") or ""
+                    if "/" in p.strip("/"):
+                        leaf_rel = "/" + p.strip("/").rsplit("/", 1)[0]
+                        break
+                # ★递归遍历叶子下所有层级：深层子文件夹内新增的文件也能被增量发现
+                all_items = _enumerate_leaf_deep(
+                    client, ref["from_uk"], ref["msg_id"], entity, direct
+                )
                 messages = [
-                    {"msg_id": ref["msg_id"], "from_uk": ref["from_uk"], "files": children}
+                    {"msg_id": ref["msg_id"], "from_uk": ref["from_uk"], "files": all_items}
                 ]
             else:
                 messages = client.list_group_files(entity)
@@ -276,10 +316,36 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
     ad_wl = ad_whitelist() if task.get("ad_skip") else []
     rules = db.list_rules(None) if task.get("rename_on") else []
 
+    # 群「具体文件夹」任务：百度转存无视 fsidlist、总把整条消息整包倒进目标目录，
+    # 且 ondup=newcopy 会在正式目录里生成 (1)(2) 副本。所以先整包转存到一个**空的**
+    # 中转目录，再把叶子文件夹内容并入固定的 target/<叶子名>（就地更新），最后删中转目录。
+    staged = (
+        kind == "group"
+        and _folder_ref(task.get("link")) is not None
+        and hasattr(client, "extract_leaf")
+    )
+    stage_dir = None
+    dest_ref = target_ref
+    if staged:
+        stage_dir = target_ref.rstrip("/") + "/_pan_auto_tmp_"
+        try:
+            # 清掉上次异常残留的中转目录，保证它是空的（否则 ondup 又会生成副本）
+            if client.dir_exists(stage_dir):
+                dr = client.delete_files([stage_dir])
+                if dr.get("taskid"):
+                    client.wait_task(dr["taskid"])
+            client.ensure_dir(stage_dir)
+            dest_ref = stage_dir
+        except Exception as e:  # noqa: BLE001
+            emit("error", f"[{name_tag}] 中转目录准备失败，退回直接转存：{e}")
+            staged = False
+            dest_ref = target_ref
+
     transferred = 0
     skipped = 0
     renamed = 0
     errors = []
+    staged_new_files = []  # 暂存已转存的叶子顶层子项，供中转→落盘后再改名
 
     for msg in messages:
         new_files = []
@@ -300,11 +366,11 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
         try:
             if kind == "friend":
                 res = client.transfer_friend_files(
-                    msg["from_uk"], msg["msg_id"], fsids, target_ref
+                    msg["from_uk"], msg["msg_id"], fsids, dest_ref
                 )
             else:
                 res = client.transfer_group_files(
-                    entity, msg["from_uk"], msg["msg_id"], fsids, target_ref
+                    entity, msg["from_uk"], msg["msg_id"], fsids, dest_ref
                 )
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
@@ -312,6 +378,20 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
             continue
 
         errno = res.get("errno")
+        # errno=12 且一个都没转（total/target_file_nums=0）：这些文件你网盘里已存在，
+        # 百度全盘去重拒绝重复转存（常见：你自己分享到群的文件、或早已同步过的文件）。
+        # 标记为已处理并软跳过——否则「每分钟」这类高频任务会永远重试、每次报错刷屏、狂打接口。
+        if errno == 12 and not (res.get("total") or res.get("target_file_nums")):
+            for f in new_files:
+                db.mark_transferred(
+                    task_id, f"{kind}_{entity}_{f['fs_id']}", f["server_filename"]
+                )
+            skipped += len(new_files)
+            emit(
+                "skip",
+                f"[{name_tag}] {len(new_files)} 个文件已存在于你的网盘，百度不允许重复转存，已跳过",
+            )
+            continue
         if errno not in (0, None):
             from app.baidu.client import _share_err
 
@@ -325,8 +405,33 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
                 task_id, f"{kind}_{entity}_{f['fs_id']}", f["server_filename"]
             )
             transferred += 1
-            renamed += _maybe_rename(client, target_ref, f, rules, name_tag, emit)
+            if staged:
+                # 文件此刻在中转目录深处，改名要等落盘到最终叶子目录后再做
+                staged_new_files.append(f)
+            else:
+                renamed += _maybe_rename(client, target_ref, f, rules, name_tag, emit)
         time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
+
+    # 群「具体文件夹」任务：把中转目录里的叶子内容并入 target/<叶子名>（就地更新），删中转目录
+    if staged and stage_dir:
+        if transferred:
+            try:
+                leaf_final = client.extract_leaf(stage_dir, target_ref, leaf_rel)
+                emit("info", f"[{name_tag}] 已整理到 → {leaf_final}")
+                for f in staged_new_files:  # 落盘后在最终目录里按规则改名并记日志
+                    renamed += _maybe_rename(client, leaf_final, f, rules, name_tag, emit)
+            except Exception as e:  # noqa: BLE001
+                emit("error", f"[{name_tag}] 目录整理失败（文件已转存到中转目录，未落盘）：{e}")
+                errors.append(f"目录整理失败：{e}")
+        else:
+            # 无新增：清掉刚建的空中转目录，别在网盘里留垃圾
+            try:
+                if client.dir_exists(stage_dir):
+                    dr = client.delete_files([stage_dir])
+                    if dr.get("taskid"):
+                        client.wait_task(dr["taskid"])
+            except Exception:  # noqa: BLE001
+                pass
 
     _summary(emit, name_tag, transferred, skipped, renamed, errors)
     db.set_task_last_run(task_id)

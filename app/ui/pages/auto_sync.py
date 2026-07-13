@@ -31,11 +31,14 @@ from app.netdisk import account_display_name
 from app import db
 
 INTERVALS = [
+    ("每 1 分钟同步一次", "1m"),
     ("每 30 分钟同步一次", "30m"),
     ("每小时同步一次", "hourly"),
     ("每 6 小时同步一次", "6h"),
     ("每天同步一次", "daily"),
 ]
+
+DEFAULT_INTERVAL = "daily"  # 新建任务的默认频率
 
 
 class TransferWorker(QThread):
@@ -166,7 +169,7 @@ class AutoSyncPage(QWidget):
         self.interval = QComboBox()
         for name, key in INTERVALS:
             self.interval.addItem(name, key)
-        self.interval.setCurrentIndex(3)
+        self.interval.setCurrentIndex(self.interval.findData(DEFAULT_INTERVAL))
         fl.addWidget(field_group("同步时间间隔", self.interval))
 
         self.note = QLineEdit()
@@ -433,7 +436,7 @@ class AutoSyncPage(QWidget):
         self.target.setText("/来自好友的分享")
         self.rename_on.setChecked(False)
         self.ad_skip.setChecked(True)
-        self.interval.setCurrentIndex(3)
+        self.interval.setCurrentIndex(self.interval.findData(DEFAULT_INTERVAL))
 
     def load_for_edit(self, task: dict):
         self.editing_id = task["id"]
@@ -486,7 +489,20 @@ class AutoSyncPage(QWidget):
             self.table.setItem(r, 0, QTableWidgetItem(prefix + name))
             self.table.setItem(r, 1, QTableWidgetItem(t.get("account_name") or "—"))
             self.table.setItem(r, 2, QTableWidgetItem(t["target_dir"]))
-            self.table.setItem(r, 3, QTableWidgetItem(_interval_text(t["interval"])))
+            # 频率：就地下拉，改完立即生效（更新频率管理）
+            freq = QComboBox()
+            freq.setObjectName("FreqCombo")
+            freq.setCursor(Qt.PointingHandCursor)
+            for _name, _key in INTERVALS:
+                freq.addItem(_interval_text(_key), _key)
+            _fi = freq.findData(t["interval"])
+            freq.setCurrentIndex(_fi if _fi >= 0 else 0)
+            freq.setToolTip("修改该任务的同步频率，选择后立即生效")
+            # 用 activated（仅用户手动选择触发，避免上面 setCurrentIndex 的程序化触发）
+            freq.activated.connect(
+                lambda _=0, tid=t["id"], cb=freq: self.change_interval(tid, cb.currentData())
+            )
+            self.table.setCellWidget(r, 3, freq)
             if t["id"] in running:
                 stxt, scolor = "⟳ 运行中", Qt.blue
             elif t["enabled"]:
@@ -537,6 +553,12 @@ class AutoSyncPage(QWidget):
     def toggle(self, task_id: int, currently_enabled: int):
         db.set_task_enabled(task_id, not currently_enabled)
         self.reload_tasks()
+
+    def change_interval(self, task_id: int, interval: str):
+        """任务列表里就地修改同步频率，立即写库并刷新（更新频率管理）。"""
+        db.set_task_interval(task_id, interval)
+        db.add_log("info", f"已将任务同步频率改为「{_interval_text(interval)}」", task_id)
+        self.reload_tasks()  # 频率变了，「下次同步」时间列要重算
 
     def on_delete(self, task_id: int):
         if (
@@ -589,6 +611,10 @@ class AutoSyncPage(QWidget):
 
 
 def _interval_text(key: str) -> str:
-    return {"30m": "每30分钟", "hourly": "每小时", "6h": "每6小时", "daily": "每天"}.get(
-        key, key
-    )
+    return {
+        "1m": "每1分钟",
+        "30m": "每30分钟",
+        "hourly": "每小时",
+        "6h": "每6小时",
+        "daily": "每天",
+    }.get(key, key)

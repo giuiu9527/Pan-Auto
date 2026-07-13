@@ -139,6 +139,35 @@ class BaiduPanClient:
         )
         return r.json()
 
+    def move_files(self, file_paths: list[str], target_dir: str) -> dict:
+        """把网盘内已有文件/文件夹移动到 target_dir（保持原名）。
+
+        移动到已存在同名文件夹时，百度会合并（把内容并进去），
+        用于「转存后去掉外层壳」时把叶子文件夹并入最终目录。
+        """
+        bd = self.get_bdstoken()
+        filelist = []
+        for path in file_paths:
+            name = path.rsplit("/", 1)[-1]
+            filelist.append({"path": path, "dest": target_dir, "newname": name})
+        r = self.s.post(
+            "https://pan.baidu.com/api/filemanager",
+            params={
+                "opera": "move",
+                "async": 2,
+                "bdstoken": bd,
+                "onnest": "fail",
+                "channel": "chunlei",
+                "web": 1,
+                "clienttype": 0,
+                "app_id": 250528,
+            },
+            data={"filelist": json.dumps(filelist, ensure_ascii=False)},
+            headers={"Referer": "https://pan.baidu.com/disk/home"},
+            timeout=30,
+        )
+        return r.json()
+
     def delete_files(self, paths: list[str]) -> dict:
         """删除网盘内文件/文件夹（path 为完整路径）。"""
         bd = self.get_bdstoken()
@@ -159,6 +188,152 @@ class BaiduPanClient:
             timeout=30,
         )
         return r.json()
+
+    def wait_task(self, taskid, timeout: float = 120.0) -> dict:
+        """轮询 filemanager 异步任务直到完成，返回最终状态。"""
+        deadline = time.time() + timeout
+        last = {}
+        while time.time() < deadline:
+            try:
+                last = self.s.get(
+                    "https://pan.baidu.com/share/taskquery",
+                    params={"taskid": taskid, "clienttype": 0, "web": 1, "app_id": 250528},
+                    timeout=15,
+                ).json()
+            except Exception:  # noqa: BLE001
+                time.sleep(0.8)
+                continue
+            if last.get("status") in ("success", "failed"):
+                return last
+            time.sleep(0.8)
+        return last or {"status": "timeout"}
+
+    def _move_wait(self, paths: list[str], dest: str) -> None:
+        """移动并等待完成；异步任务轮询到结束。"""
+        r = self.move_files(paths, dest)
+        if r.get("taskid"):
+            self.wait_task(r["taskid"])
+
+    def merge_move_into(self, src_dir: str, dst_dir: str) -> int:
+        """把 src_dir 里的所有内容并入 dst_dir（递归处理同名文件夹冲突）。
+
+        百度 move 到已存在同名文件夹会报 -8，不会自动合并，所以这里：
+        - 目标没有同名项 → 直接移动（批量）。
+        - 同名且都是文件夹 → 递归并入。
+        - 同名文件 → 跳过（保留 dst 原有，避免覆盖）。
+        返回移动的顶层项数。
+        """
+        self.ensure_dir(dst_dir)
+        try:
+            children = self.list_dir(src_dir)
+        except Exception:  # noqa: BLE001
+            return 0
+        existing = {}
+        try:
+            for it in self.list_dir(dst_dir):
+                existing[it.get("server_filename")] = int(it.get("isdir") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        moved = 0
+        to_move = []
+        conflict_dirs = []
+        for ch in children:
+            name = ch.get("server_filename")
+            if name is None:
+                continue
+            if name not in existing:
+                to_move.append(src_dir.rstrip("/") + "/" + name)
+            elif int(ch.get("isdir") or 0) and existing.get(name):
+                conflict_dirs.append(name)
+            # 同名文件：跳过
+        if to_move:
+            # 分批移动，防止单次请求过大
+            for i in range(0, len(to_move), 100):
+                self._move_wait(to_move[i : i + 100], dst_dir)
+            moved += len(to_move)
+        for name in conflict_dirs:
+            moved += self.merge_move_into(
+                src_dir.rstrip("/") + "/" + name, dst_dir.rstrip("/") + "/" + name
+            )
+        return moved
+
+    def _dir_empty(self, path: str) -> bool:
+        try:
+            return len(self.list_dir(path)) == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def unnest_after_transfer(self, target_dir: str, leaf_rel: str) -> str:
+        """去掉群文件转存自动重建的外层目录（含百度连带转来的无关兄弟内容）。
+
+        百度群转存无视 fsidlist、总是把整条消息（整个顶层共享文件夹）按相对
+        分享根的路径整包重建，导致选中的叶子文件夹被包在一层/多层「外壳」里、
+        且外壳里还塞着别的兄弟文件。这里把叶子文件夹的内容并入
+        target_dir/<叶子名>，再把整个外壳（连同无关兄弟）删掉。返回最终目录。
+
+        leaf_rel 形如 '/2027白鹭申论全年班讲义/2027扎马步2.0'（相对分享根）。
+        """
+        target = (target_dir or "/").rstrip("/")
+        segs = [s for s in leaf_rel.split("/") if s]
+        if len(segs) < 2:
+            # 没有外壳（叶子就在分享根下），无需处理
+            return target + "/" + segs[0] if segs else target
+        leaf_name = segs[-1]
+        leaf_src = target + "/" + "/".join(segs)      # 外壳里的叶子
+        final_dst = target + "/" + leaf_name          # 想要的最终位置
+        wrapper_top = target + "/" + segs[0]          # 百度建的最顶层外壳
+        if leaf_src == final_dst or wrapper_top == final_dst:
+            # 叶子名与外壳顶层同名等边界情况：不做危险删除
+            return final_dst
+        self.merge_move_into(leaf_src, final_dst)
+        # 叶子已挪出；把百度整包倒进来的外壳（含广告/无关兄弟）整个删掉
+        if self._dir_empty(leaf_src):
+            dr = self.delete_files([wrapper_top])
+            if dr.get("taskid"):
+                self.wait_task(dr["taskid"])
+        return final_dst
+
+    def extract_leaf(self, stage_dir: str, final_parent: str, leaf_rel: str) -> str:
+        """把「临时中转目录」里的叶子文件夹内容并入 final_parent/<叶子名>，再删掉整个中转目录。
+
+        群「具体文件夹」任务的正确落盘方式：先把整条消息整包转存到一个**空的**中转目录
+        stage_dir（见 core/transfer），再从中把选中的叶子文件夹内容并入 final_parent/<叶子名>。
+        该最终目录跨次同步固定不变，所以增量同步是**就地更新**、不会再生成 (1)(2) 副本。
+        最后把整个 stage_dir 删掉（连同外壳、无关兄弟、广告）。返回最终叶子目录路径。
+
+        ★关键坑：`leaf_rel` 来自 shareinfo 的 `path`，是**分享者网盘里的绝对路径**，
+        开头可能带分享者自己的私有目录（如 `/我的资源/...`）；但百度整包转存重建时是
+        **从被分享的顶层开始**、会**丢掉分享根以上的私有前缀**。所以不能直接用 `stage+leaf_rel`
+        定位——那样会找不到叶子、把最终目录建成空的。这里改为**从叶子路径逐段去头、
+        最长优先**地在 staging 里找真实存在的叶子位置（2026-07 实测逆向）。
+
+        leaf_rel 为空时退化为把整个中转目录内容并入 final_parent（无法隔离叶子的兜底）。
+        """
+        stage = (stage_dir or "").rstrip("/")
+        parent = (final_parent or "/").rstrip("/")
+        segs = [s for s in (leaf_rel or "").split("/") if s]
+        leaf_in_stage = None
+        if segs:
+            # 逐段去头找真实叶子位置：i=0 是完整绝对路径，i 越大前缀去得越多；最长匹配优先
+            for i in range(len(segs)):
+                cand = stage + "/" + "/".join(segs[i:])
+                if self.dir_exists(cand):
+                    leaf_in_stage = cand
+                    break
+        if leaf_in_stage:
+            leaf_final = parent + "/" + segs[-1]
+            self.merge_move_into(leaf_in_stage, leaf_final)
+        else:
+            # 找不到叶子（leaf_rel 为空，或结构异常）：兜底把整个 staging 内容并入 parent
+            leaf_final = parent
+            self.merge_move_into(stage, parent)
+        # 删掉整个中转目录（外壳 + 无关兄弟 + 广告）
+        if self.dir_exists(stage):
+            dr = self.delete_files([stage])
+            if dr.get("taskid"):
+                self.wait_task(dr["taskid"])
+        return leaf_final
 
     # ---- 分享转存（骨架，Phase 2 实现）----
     @staticmethod

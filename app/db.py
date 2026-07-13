@@ -311,6 +311,12 @@ def set_task_enabled(task_id: int, enabled: bool) -> None:
         c.execute("UPDATE tasks SET enabled=? WHERE id=?", (int(enabled), task_id))
 
 
+def set_task_interval(task_id: int, interval: str) -> None:
+    """只更新任务的同步间隔（供任务列表里就地改频率用）。"""
+    with get_conn() as c:
+        c.execute("UPDATE tasks SET interval=? WHERE id=?", (interval, task_id))
+
+
 # ---- rename rules ----
 def list_rules(task_id: Optional[int] = None) -> list[dict]:
     with get_conn() as c:

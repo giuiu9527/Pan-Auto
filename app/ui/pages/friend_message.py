@@ -34,17 +34,24 @@ from app.core.transfer import run_task
 from app import db
 
 INTERVALS = [
+    ("每 1 分钟同步一次", "1m"),
     ("每 30 分钟同步一次", "30m"),
     ("每小时同步一次", "hourly"),
     ("每 6 小时同步一次", "6h"),
     ("每天同步一次", "daily"),
 ]
 
+DEFAULT_INTERVAL = "daily"
+
 
 def _interval_text(key: str) -> str:
-    return {"30m": "每30分钟", "hourly": "每小时", "6h": "每6小时", "daily": "每天"}.get(
-        key, key
-    )
+    return {
+        "1m": "每1分钟",
+        "30m": "每30分钟",
+        "hourly": "每小时",
+        "6h": "每6小时",
+        "daily": "每天",
+    }.get(key, key)
 
 
 def _fmt_size(n: int) -> str:
@@ -314,7 +321,7 @@ class FriendMessagePage(QWidget):
         self.interval = QComboBox()
         for nm, key in INTERVALS:
             self.interval.addItem(nm, key)
-        self.interval.setCurrentIndex(3)
+        self.interval.setCurrentIndex(self.interval.findData(DEFAULT_INTERVAL))
         opt.addWidget(self.interval)
         self.rename_on = QCheckBox("转存后重命名")
         opt.addWidget(self.rename_on)

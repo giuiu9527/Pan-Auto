@@ -189,6 +189,51 @@ class BaiduPanClient:
         )
         return r.json()
 
+    def purge_ad_items(
+        self, root: str, ad_kw: list[str], whitelist: list[str] | None = None
+    ) -> int:
+        """递归删除 ``root`` 内名字命中广告词的文件**和文件夹**。
+
+        命中文件夹时直接删整棵子树，不再继续深入；这样群消息转存时被接口
+        连带带下来的广告目录不会在最终落盘后残留。
+        """
+        if not ad_kw:
+            return 0
+        whitelist = whitelist or []
+        keywords = [k.lower() for k in ad_kw if k]
+        protected = [k.lower() for k in whitelist if k]
+        pending = [root]
+        matches = []
+        while pending:
+            current = pending.pop()
+            try:
+                items = self.list_dir(current)
+            except Exception:  # noqa: BLE001
+                continue
+            for item in items:
+                name = item.get("server_filename") or ""
+                low = name.lower()
+                if any(w in low for w in protected):
+                    # 白名单文件夹及其全部内容均保留。
+                    continue
+                path = item.get("path")
+                if not path:
+                    continue
+                if any(k in low for k in keywords):
+                    matches.append(path)
+                elif item.get("isdir"):
+                    pending.append(path)
+
+        deleted = 0
+        for i in range(0, len(matches), 100):
+            batch = matches[i : i + 100]
+            result = self.delete_files(batch)
+            if result.get("taskid"):
+                self.wait_task(result["taskid"])
+            if result.get("errno") in (0, None):
+                deleted += len(batch)
+        return deleted
+
     def wait_task(self, taskid, timeout: float = 120.0) -> dict:
         """轮询 filemanager 异步任务直到完成，返回最终状态。"""
         deadline = time.time() + timeout

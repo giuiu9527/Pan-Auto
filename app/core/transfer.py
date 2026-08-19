@@ -246,6 +246,16 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
             renamed += _maybe_rename(client, target_ref, f, rules, name_tag, emit)
         time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
 
+    # 分享接口按选中项转存，但广告文件夹本身仍可能已在目标目录或由服务端
+    # 连带写入；百度客户端支持递归删除命中广告词的文件夹及其所有内容。
+    if ad_kw and hasattr(client, "purge_ad_items"):
+        try:
+            removed = client.purge_ad_items(target_ref, ad_kw, ad_wl)
+            if removed:
+                emit("info", f"[{name_tag}] 已清理 {removed} 个广告文件/文件夹")
+        except Exception as e:  # noqa: BLE001
+            emit("error", f"[{name_tag}] 广告清理失败：{e}")
+
     _summary(emit, name_tag, transferred, skipped, renamed, errors)
     db.set_task_last_run(task_id)
     return _result(transferred, skipped, renamed, "; ".join(errors))
@@ -416,6 +426,12 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
     if staged and stage_dir:
         if transferred:
             try:
+                # 群转存接口会无视 fsidlist 整包倒入中转目录；在合并到正式目录
+                # 前递归删掉命中广告词的文件夹（整棵删除）和文件。
+                if ad_kw and hasattr(client, "purge_ad_items"):
+                    removed = client.purge_ad_items(stage_dir, ad_kw, ad_wl)
+                    if removed:
+                        emit("info", f"[{name_tag}] 已清理 {removed} 个广告文件/文件夹")
                 leaf_final = client.extract_leaf(stage_dir, target_ref, leaf_rel)
                 emit("info", f"[{name_tag}] 已整理到 → {leaf_final}")
                 for f in staged_new_files:  # 落盘后在最终目录里按规则改名并记日志

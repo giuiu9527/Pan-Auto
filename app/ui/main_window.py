@@ -374,15 +374,18 @@ class MainWindow(QWidget):
         self.scheduler.task_ran.connect(self._on_scheduled_task_ran)
         self.scheduler.swept.connect(self._on_scheduler_swept)
         self.scheduler.start()
+        self._setup_tray()
 
     def _on_scheduled_task_started(self, task_id: int):
         if self.stack.currentWidget() is self.auto:
             self.auto.reload_tasks()
 
-        self._setup_tray()
-
     # ---- 系统托盘 ----
     def _setup_tray(self):
+        # 托盘只允许创建一次。以前每次定时任务启动都会新建一个
+        # QSystemTrayIcon，Windows 通知区域就会出现一串重复的小图标。
+        if hasattr(self, "tray"):
+            return
         self.tray = QSystemTrayIcon(self)
         if not self._app_icon.isNull():
             self.tray.setIcon(self._app_icon)

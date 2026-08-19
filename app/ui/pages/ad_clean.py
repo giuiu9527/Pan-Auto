@@ -1,4 +1,4 @@
-"""广告清理页：扫描网盘文件夹里命中广告关键词的文件，勾选后删除。
+"""广告清理页：扫描网盘文件夹里命中广告关键词的文件/文件夹，勾选后删除。
 
 关键词与「自动同步」的去广告共用同一份配置（app_settings.ad_keywords）。
 """
@@ -77,10 +77,6 @@ class ScanWorker(QThread):
                 self.progress.emit(f"扫描中… 已查 {scanned} 个目录，命中 {len(matched)}")
                 items = client.list_dir(cur)
                 for it in items:
-                    if it.get("isdir"):
-                        if self.recursive and it.get("path"):
-                            q.append(it["path"])
-                        continue
                     name = it.get("server_filename", "")
                     low = name.lower()
                     if any(w in low for w in self.whitelist):
@@ -92,8 +88,13 @@ class ScanWorker(QThread):
                                 "path": it.get("path", ""),
                                 "size": it.get("size", 0),
                                 "dir": cur,
+                                "isdir": bool(it.get("isdir")),
                             }
                         )
+                        # 命中文件夹时删整个子树，无需继续扫描里面的项。
+                        continue
+                    if it.get("isdir") and self.recursive and it.get("path"):
+                        q.append(it["path"])
             self.done.emit(matched)
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
@@ -186,7 +187,7 @@ class AdCleanPage(QWidget):
         self.recursive.setChecked(True)
         fl.addWidget(self.recursive)
 
-        fl.addWidget(field_label("广告关键词（命中即视为广告文件）"))
+        fl.addWidget(field_label("广告关键词（命中即视为广告文件/文件夹）"))
         fl.addWidget(label("一行一个或用逗号分隔；与「自动同步」的去广告共用。", "Muted"))
         self.kw_input = QPlainTextEdit()
         self.kw_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
@@ -233,7 +234,7 @@ class AdCleanPage(QWidget):
         rl.setContentsMargins(6, 14, 20, 16)
         rl.setSpacing(10)
         head = QHBoxLayout()
-        t = QLabel("命中的广告文件")
+        t = QLabel("命中的广告文件/文件夹")
         t.setObjectName("PageTitle")
         head.addWidget(t)
         head.addStretch()
@@ -246,7 +247,7 @@ class AdCleanPage(QWidget):
         cl = QVBoxLayout(c)
         cl.setContentsMargins(6, 6, 6, 6)
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["文件名", "大小", "所在目录"])
+        self.table.setHorizontalHeaderLabels(["文件/文件夹名", "大小", "所在目录"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         hh = self.table.horizontalHeader()
@@ -380,9 +381,9 @@ class AdCleanPage(QWidget):
             self.table.setItem(r, 1, QTableWidgetItem(_fmt_size(f.get("size", 0))))
             from app.quark.client import display_path
             self.table.setItem(r, 2, QTableWidgetItem(display_path(f.get("dir", ""))))
-        self.status.setText(f"命中 {len(matched)} 个广告文件（默认全选，可取消不删的）")
+        self.status.setText(f"命中 {len(matched)} 个广告文件/文件夹（默认全选，可取消不删的）")
         if not matched:
-            QMessageBox.information(self, "扫描完成", "没有命中广告关键词的文件。")
+            QMessageBox.information(self, "扫描完成", "没有命中广告关键词的文件或文件夹。")
 
     def _on_scan_error(self, msg: str):
         self.scan_btn.setEnabled(True)

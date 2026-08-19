@@ -528,8 +528,6 @@ class AutoSyncPage(QWidget):
             run_b.clicked.connect(lambda _=False, tt=dict(t): self.run_now(tt))
             resync_b = _icon_btn("sync", "#e67e22", "重新同步（清去重记录后全量重转，用于你删过目标文件想重新拉回）")
             resync_b.clicked.connect(lambda _=False, tt=dict(t): self.resync_now(tt))
-            edit_b = _icon_btn("edit", "#334155", "编辑")
-            edit_b.clicked.connect(lambda _=False, tt=dict(t): self.load_for_edit(tt))
             toggle_b = _icon_btn(
                 "pause" if t["enabled"] else "play",
                 "#a16207" if t["enabled"] else "#18a957",
@@ -540,7 +538,8 @@ class AutoSyncPage(QWidget):
             )
             del_b = _icon_btn("trash", "#e5484d", "删除")
             del_b.clicked.connect(lambda _=False, tid=t["id"]: self.on_delete(tid))
-            for b in (run_b, resync_b, edit_b, toggle_b, del_b):
+            # 频率可直接在本行修改；保留核心四项操作，避免每条任务堆满小图标。
+            for b in (run_b, resync_b, toggle_b, del_b):
                 ol.addWidget(b)
             self.table.setCellWidget(r, 5, ops)
 

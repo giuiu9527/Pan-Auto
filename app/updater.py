@@ -25,9 +25,9 @@ else:
     ROOT = Path(__file__).resolve().parents[1]
 
 REMOTE = os.environ.get("PAN_AUTO_UPDATE_REMOTE", "origin")
-# 打包版查 Release 用「公开发布库」（源码库私有，普通用户免登录即可下更新）；
-# 源码版更新走 git origin（私有源码库，开发者本机有凭据）。
-GITHUB_REPO = os.environ.get("PAN_AUTO_GITHUB_REPO", "loadingkuu/Pan-Auto-release")
+# 打包版查公开 GitHub Release，普通用户无需登录即可下载更新；
+# 源码版仍通过 git origin 拉取当前分支。
+GITHUB_REPO = os.environ.get("PAN_AUTO_GITHUB_REPO", "giuiu9527/Pan-Auto")
 GITHUB_TOKEN_ENV = "PAN_AUTO_GITHUB_TOKEN"
 ASSET_PATTERN = re.compile(r"Pan-Auto-.*windows-x64\.zip$", re.IGNORECASE)
 

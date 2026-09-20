@@ -89,6 +89,10 @@ def init_db() -> None:
         _ensure_column(c, "tasks", "entity_id", "TEXT")
         _ensure_column(c, "tasks", "entity_name", "TEXT")
         _ensure_column(c, "tasks", "ad_skip", "INTEGER NOT NULL DEFAULT 0")
+        # 连续失败次数：调度器据此指数退避，避免网络/风控故障时每分钟狂打接口
+        _ensure_column(c, "tasks", "fail_count", "INTEGER NOT NULL DEFAULT 0")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_logs_id ON logs(id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level)")
         # 旧任务（无绑定账号）归到首个账号
         first = c.execute("SELECT id FROM accounts ORDER BY created_at LIMIT 1").fetchone()
         if first:
@@ -317,6 +321,40 @@ def set_task_interval(task_id: int, interval: str) -> None:
         c.execute("UPDATE tasks SET interval=? WHERE id=?", (interval, task_id))
 
 
+def bump_task_fail_count(task_id: Optional[int], failed: bool) -> None:
+    """失败 +1（上限 10），成功清零。"""
+    if task_id is None:
+        return
+    with get_conn() as c:
+        if failed:
+            c.execute(
+                "UPDATE tasks SET fail_count=MIN(COALESCE(fail_count,0)+1, 10) WHERE id=?",
+                (task_id,),
+            )
+        else:
+            c.execute("UPDATE tasks SET fail_count=0 WHERE id=?", (task_id,))
+
+
+def task_counts() -> dict:
+    """任务总数 / 启用数（主页概览用）。"""
+    with get_conn() as c:
+        total = c.execute("SELECT COUNT(*) n FROM tasks").fetchone()["n"]
+        enabled = c.execute("SELECT COUNT(*) n FROM tasks WHERE enabled=1").fetchone()["n"]
+        transferred = c.execute("SELECT COUNT(*) n FROM transferred").fetchone()["n"]
+        last = c.execute("SELECT MAX(last_run) t FROM tasks").fetchone()["t"]
+        errors = c.execute(
+            "SELECT COUNT(*) n FROM logs WHERE level='error' AND ts>?",
+            (int(time.time()) - 86400,),
+        ).fetchone()["n"]
+    return {
+        "total": total,
+        "enabled": enabled,
+        "transferred": transferred,
+        "last_run": last or 0,
+        "errors_24h": errors,
+    }
+
+
 # ---- rename rules ----
 def list_rules(task_id: Optional[int] = None) -> list[dict]:
     with get_conn() as c:
@@ -362,12 +400,40 @@ def add_log(level: str, message: str, task_id: Optional[int] = None) -> None:
         )
 
 
-def list_logs(limit: int = 200) -> list[dict]:
+def list_logs(limit: int = 200, level: Optional[str] = None, query: str = "") -> list[dict]:
+    sql = "SELECT * FROM logs"
+    conds = []
+    args: list = []
+    if level:
+        conds.append("level=?")
+        args.append(level)
+    if query:
+        conds.append("message LIKE ?")
+        args.append(f"%{query}%")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
     with get_conn() as c:
-        rows = c.execute(
-            "SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
+
+
+def clear_logs() -> None:
+    with get_conn() as c:
+        c.execute("DELETE FROM logs")
+
+
+def prune_logs(keep: int = 5000) -> int:
+    """只保留最近 keep 条日志（高频任务几天就能攒上万条，拖慢日志页）。"""
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT id FROM logs ORDER BY id DESC LIMIT 1 OFFSET ?", (keep,)
+        ).fetchone()
+        if not row:
+            return 0
+        cur = c.execute("DELETE FROM logs WHERE id<=?", (row["id"],))
+        return cur.rowcount
 
 
 # ---- dedup ----

@@ -66,51 +66,104 @@ class BaiduPanClient:
         d = r.json()
         return {"used": d.get("used", 0), "total": d.get("total", 0)}
 
+    def _get_json(self, url: str, params: dict, timeout: float = 20, retries: int = 2,
+                  headers: Optional[dict] = None) -> dict:
+        """GET 并解析 JSON；网络抖动时自动重试（指数退避）。
+
+        百度接口偶发 Read timed out / 连接重置，以前一次失败就当「目录不存在」，
+        是重复文件夹的根因之一。这里只对网络层错误重试，业务 errno 交给调用方。
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                r = self.s.get(url, params=params, timeout=timeout, headers=headers)
+                return r.json()
+            except (requests.RequestException, ValueError) as e:
+                last_exc = e
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(f"网络请求失败：{last_exc}")
+
     def list_dir(self, path: str = "/") -> list[dict]:
-        r = self.s.get(
-            "https://pan.baidu.com/api/list",
-            params={"dir": path, "order": "name", "web": 1, "num": 1000, "page": 1},
-            timeout=20,
-        )
-        return r.json().get("list", [])
+        """列目录（自动翻页取全）。目录不存在或接口报错时**抛异常**，不再静默返回空列表。
+
+        以前接口报错（登录失效 / 风控 / 超时）也返回 []，上层据此以为「目录不存在」
+        而重新建目录，百度就生成 `xxx_20260920_073412` 这种带时间戳的副本。
+        """
+        out: list[dict] = []
+        page = 1
+        num = 1000
+        while page <= 50:
+            d = self._get_json(
+                "https://pan.baidu.com/api/list",
+                params={
+                    "dir": path, "order": "name", "desc": 0, "web": 1,
+                    "num": num, "page": page, "clienttype": 0, "app_id": 250528,
+                },
+            )
+            errno = d.get("errno")
+            if errno not in (0, None):
+                raise RuntimeError(_share_err(errno, f"列目录失败：{path}"))
+            items = d.get("list") or []
+            out.extend(items)
+            if len(items) < num:
+                break
+            page += 1
+        return out
 
     def create_dir(self, path: str) -> dict:
+        """创建目录。**rtype=0**：路径已存在时返回 errno=-8，不会另建副本。
+
+        ★以前用 rtype=1，那是「冲突时自动改名」策略——百度会新建
+        `名字_YYYYMMDD_HHMMSS` 的副本目录，正是「一堆同名文件夹」的根因。
+        """
         bd = self.get_bdstoken()
         r = self.s.post(
             "https://pan.baidu.com/api/create",
-            params={"a": "commit", "bdstoken": bd},
-            # rtype=1：路径冲突时返回已存在目录而非新建带时间戳的副本
-            data={"path": path, "isdir": 1, "rtype": 1, "block_list": "[]"},
+            params={
+                "a": "commit", "bdstoken": bd, "channel": "chunlei",
+                "web": 1, "clienttype": 0, "app_id": 250528,
+            },
+            data={"path": path, "isdir": 1, "rtype": 0, "block_list": "[]"},
             timeout=15,
         )
-        return r.json()
+        d = r.json()
+        errno = d.get("errno")
+        if errno == -8:  # 已存在：视为成功
+            d["errno"] = 0
+            d["existed"] = True
+        return d
 
     def dir_exists(self, path: str) -> bool:
-        """目标目录是否已存在（避免重复创建出带时间戳的空文件夹）。"""
+        """目录是否存在：直接列该路径，errno=-9 才是「不存在」，其它错误上抛。"""
         if path in ("/", ""):
             return True
-        parent = path.rsplit("/", 1)[0] or "/"
-        name = path.rsplit("/", 1)[-1]
-        try:
-            for it in self.list_dir(parent):
-                if it.get("isdir") and it.get("server_filename") == name:
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        return False
+        d = self._get_json(
+            "https://pan.baidu.com/api/list",
+            params={"dir": path, "web": 1, "num": 1, "page": 1, "clienttype": 0,
+                    "app_id": 250528},
+        )
+        errno = d.get("errno")
+        if errno in (0, None):
+            return True
+        if errno == -9:
+            return False
+        raise RuntimeError(_share_err(errno, f"检查目录失败：{path}"))
 
     def ensure_dir(self, path: str) -> None:
-        """确保目录存在：已存在则什么都不做，不存在才创建。"""
+        """确保目录存在：已存在则什么都不做，不存在才创建（创建冲突也不会生成副本）。"""
         if path in ("/", ""):
             return
         if self.dir_exists(path):
             return
-        self.create_dir(path)
+        d = self.create_dir(path)
+        if d.get("errno") not in (0, None):
+            raise RuntimeError(_share_err(d.get("errno"), f"创建目录失败：{path}"))
 
     def rename(self, path: str, newname: str) -> dict:
         """重命名网盘内文件/文件夹。path 为完整路径。"""
         bd = self.get_bdstoken()
-        filelist = f'[{{"path":"{path}","newname":"{newname}"}}]'
+        filelist = json.dumps([{"path": path, "newname": newname}], ensure_ascii=False)
         r = self.s.post(
             "https://pan.baidu.com/api/filemanager",
             params={"opera": "rename", "async": 2, "bdstoken": bd, "onnest": "fail"},
@@ -204,8 +257,10 @@ class BaiduPanClient:
         protected = [k.lower() for k in whitelist if k]
         pending = [root]
         matches = []
-        while pending:
+        calls = 0
+        while pending and calls < 400:
             current = pending.pop()
+            calls += 1
             try:
                 items = self.list_dir(current)
             except Exception:  # noqa: BLE001
@@ -254,8 +309,20 @@ class BaiduPanClient:
         return last or {"status": "timeout"}
 
     def _move_wait(self, paths: list[str], dest: str) -> None:
-        """移动并等待完成；异步任务轮询到结束。"""
+        """移动并等待完成；异步任务轮询到结束。失败上抛。"""
         r = self.move_files(paths, dest)
+        if r.get("errno") not in (0, None):
+            raise RuntimeError(_share_err(r.get("errno"), "移动文件失败"))
+        if r.get("taskid"):
+            st = self.wait_task(r["taskid"])
+            if st.get("status") == "failed":
+                raise RuntimeError(f"移动文件任务失败：{st}")
+
+    def delete_and_wait(self, paths: list[str]) -> None:
+        """删除并等待异步任务完成；失败上抛。"""
+        r = self.delete_files(paths)
+        if r.get("errno") not in (0, None):
+            raise RuntimeError(_share_err(r.get("errno"), "删除失败"))
         if r.get("taskid"):
             self.wait_task(r["taskid"])
 
@@ -269,16 +336,12 @@ class BaiduPanClient:
         返回移动的顶层项数。
         """
         self.ensure_dir(dst_dir)
-        try:
-            children = self.list_dir(src_dir)
-        except Exception:  # noqa: BLE001
-            return 0
+        children = self.list_dir(src_dir)
+        # 目标目录列不出来就必须失败：若把它当成空目录，会把所有项都搬过去，
+        # 百度 move 遇到同名报 -8，整批失败或产生副本。
         existing = {}
-        try:
-            for it in self.list_dir(dst_dir):
-                existing[it.get("server_filename")] = int(it.get("isdir") or 0)
-        except Exception:  # noqa: BLE001
-            pass
+        for it in self.list_dir(dst_dir):
+            existing[it.get("server_filename")] = int(it.get("isdir") or 0)
 
         moved = 0
         to_move = []
@@ -302,42 +365,6 @@ class BaiduPanClient:
                 src_dir.rstrip("/") + "/" + name, dst_dir.rstrip("/") + "/" + name
             )
         return moved
-
-    def _dir_empty(self, path: str) -> bool:
-        try:
-            return len(self.list_dir(path)) == 0
-        except Exception:  # noqa: BLE001
-            return False
-
-    def unnest_after_transfer(self, target_dir: str, leaf_rel: str) -> str:
-        """去掉群文件转存自动重建的外层目录（含百度连带转来的无关兄弟内容）。
-
-        百度群转存无视 fsidlist、总是把整条消息（整个顶层共享文件夹）按相对
-        分享根的路径整包重建，导致选中的叶子文件夹被包在一层/多层「外壳」里、
-        且外壳里还塞着别的兄弟文件。这里把叶子文件夹的内容并入
-        target_dir/<叶子名>，再把整个外壳（连同无关兄弟）删掉。返回最终目录。
-
-        leaf_rel 形如 '/2027白鹭申论全年班讲义/2027扎马步2.0'（相对分享根）。
-        """
-        target = (target_dir or "/").rstrip("/")
-        segs = [s for s in leaf_rel.split("/") if s]
-        if len(segs) < 2:
-            # 没有外壳（叶子就在分享根下），无需处理
-            return target + "/" + segs[0] if segs else target
-        leaf_name = segs[-1]
-        leaf_src = target + "/" + "/".join(segs)      # 外壳里的叶子
-        final_dst = target + "/" + leaf_name          # 想要的最终位置
-        wrapper_top = target + "/" + segs[0]          # 百度建的最顶层外壳
-        if leaf_src == final_dst or wrapper_top == final_dst:
-            # 叶子名与外壳顶层同名等边界情况：不做危险删除
-            return final_dst
-        self.merge_move_into(leaf_src, final_dst)
-        # 叶子已挪出；把百度整包倒进来的外壳（含广告/无关兄弟）整个删掉
-        if self._dir_empty(leaf_src):
-            dr = self.delete_files([wrapper_top])
-            if dr.get("taskid"):
-                self.wait_task(dr["taskid"])
-        return final_dst
 
     def extract_leaf(self, stage_dir: str, final_parent: str, leaf_rel: str) -> str:
         """把「临时中转目录」里的叶子文件夹内容并入 final_parent/<叶子名>，再删掉整个中转目录。
@@ -375,9 +402,7 @@ class BaiduPanClient:
             self.merge_move_into(stage, parent)
         # 删掉整个中转目录（外壳 + 无关兄弟 + 广告）
         if self.dir_exists(stage):
-            dr = self.delete_files([stage])
-            if dr.get("taskid"):
-                self.wait_task(dr["taskid"])
+            self.delete_and_wait([stage])
         return leaf_final
 
     # ---- 分享转存（骨架，Phase 2 实现）----
@@ -746,13 +771,14 @@ class BaiduPanClient:
         return f"{meta['shareid']}_{f['fs_id']}"
 
     def resolve_target(self, target_dir: str) -> str:
-        """确保目标目录存在，返回目录路径（百度直接用路径定位）。"""
-        target = target_dir or "/"
+        """确保目标目录存在，返回规范化的目录路径（百度直接用路径定位）。
+
+        路径统一去掉末尾斜杠；建目录失败直接上抛（由上层记错误并停止本次同步），
+        不再吞掉——吞掉后转存接口会自己按 ondup 策略建目录，又是副本来源。
+        """
+        target = _norm_path(target_dir)
         if target != "/":
-            try:
-                self.ensure_dir(target)
-            except Exception:  # noqa: BLE001
-                pass
+            self.ensure_dir(target)
         return target
 
     def save_files(self, meta: dict, files: list[dict], target_ref: str) -> dict:
@@ -790,6 +816,18 @@ def _join_path(target_dir: str, name: str) -> str:
     if target_dir.endswith("/"):
         return target_dir + name
     return target_dir + "/" + name
+
+
+def _norm_path(path: str) -> str:
+    """规范化网盘路径：去首尾空白、保证以 / 开头、去掉末尾多余的 /。"""
+    p = (path or "").strip().replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p
+    while "//" in p:
+        p = p.replace("//", "/")
+    if len(p) > 1:
+        p = p.rstrip("/")
+    return p or "/"
 
 
 def _result_dict(data) -> dict:
@@ -928,10 +966,12 @@ def _extract_file_list(rec: dict) -> list:
 
 _SHARE_ERRNO = {
     -1: "分享链接已失效或被删除",
+    -3: "文件不存在",
     -4: "登录态失效，请重新登录",
-    -6: "请重新登录",
+    -6: "登录已失效，请到「设置」重新登录",
+    -7: "文件名非法或路径过长",
     -8: "目标目录中已存在同名文件",
-    -9: "提取码错误",
+    -9: "文件或目录不存在 / 提取码错误",
     -10: "网盘容量不足",
     -12: "提取码错误",
     -33: "转存文件数超过单次限制（一次最多约 1000 个）",
@@ -940,6 +980,9 @@ _SHARE_ERRNO = {
     12: "部分文件转存失败（可能已存在）",
     105: "链接格式不正确",
     115: "该分享不支持转存",
+    31034: "触发百度接口频控（操作太频繁），请降低同步频率稍后再试",
+    31045: "登录态异常，请重新登录",
+    31066: "文件不存在",
 }
 
 

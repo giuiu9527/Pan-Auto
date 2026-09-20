@@ -1,16 +1,19 @@
 """后台定时调度器。
 
 一个常驻后台线程，周期性扫描已启用的任务，把到期的（按 interval 与
-last_run 判断）逐个执行。任务执行本身会把日志写入数据库。
+last_run 判断，连续失败会退避）逐个执行。任务执行本身会把日志写入数据库。
 
 设计上串行执行任务：转存都是网络操作且需要节流防风控，串行更安全。
+`run_task` 内部还有全局锁与任务级重入保护，所以即使用户同时点了「立即同步」，
+也不会出现同一任务两份在跑。
 """
 import threading
+import time
 
 from PySide6.QtCore import QThread, Signal
 
 from app import db
-from app.core.transfer import run_task, is_task_due, next_run_ts
+from app.core.transfer import run_task, is_task_due, next_run_ts, is_task_running
 
 
 class Scheduler(QThread):
@@ -21,12 +24,13 @@ class Scheduler(QThread):
     # 每轮扫描结束（UI 可借此刷新列表/日志）
     swept = Signal()
 
-    def __init__(self, check_interval: int = 60, startup_delay: int = 15):
+    def __init__(self, check_interval: int = 30, startup_delay: int = 15):
         super().__init__()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self.check_interval = check_interval
         self.startup_delay = startup_delay
+        self._sweeps = 0
 
     def run(self):
         # 启动后先等一会，让界面加载完再开始扫描
@@ -50,6 +54,8 @@ class Scheduler(QThread):
                 return
             if not t.get("enabled"):
                 continue
+            if is_task_running(t["id"]):
+                continue
             if not is_task_due(t):
                 continue
             try:
@@ -59,19 +65,24 @@ class Scheduler(QThread):
                 self._log_done(t, result)
             except Exception as e:  # noqa: BLE001
                 db.add_log("error", f"任务执行异常（id={t.get('id')}）：{e}", t.get("id"))
+        self._sweeps += 1
+        if self._sweeps % 20 == 0:  # 每 ~10 分钟修剪一次日志表
+            try:
+                db.prune_logs(5000)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _log_done(self, task: dict, result: dict):
-        """定时同步跑完记一条清晰的完成提示（带下次同步时间）。"""
-        import time
-
+        """定时同步有实际变化或出错时记一条完成提示（带下次同步时间）；无变化不刷屏。"""
+        if not result.get("transferred") and not result.get("error"):
+            return
         name = task.get("note") or task.get("entity_name") or task.get("link") or "任务"
-        # run_task 已更新 last_run，这里据此算下次时间
         fresh = db.get_task(task["id"]) or task
         nxt = next_run_ts(fresh)
         nxt_text = time.strftime("%m-%d %H:%M", time.localtime(nxt)) if nxt else "稍后"
         db.add_log(
             "info",
-            f"⏱ 定时同步「{name}」完成：新增 {result.get('transferred', 0)}、"
+            f"定时同步「{name}」完成：新增 {result.get('transferred', 0)}、"
             f"跳过 {result.get('skipped', 0)}、改名 {result.get('renamed', 0)}；"
             f"下次约 {nxt_text}",
             task["id"],

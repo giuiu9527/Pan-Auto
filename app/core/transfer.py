@@ -2,6 +2,10 @@
 
 统一处理：去重 → 去广告 → 转存 → 关键字重命名。所有步骤写入日志表。
 供「立即转存」按钮与后台定时调度共用。
+
+★并发约束：同一时刻只允许一个任务在跑（全局锁），同一任务不允许重入。
+以前「立即同步」按钮和后台调度器可以同时跑同一个任务，两边同时建目录 /
+同时转存，就会出现重复文件夹和重复文件。
 """
 import time
 import random
@@ -21,11 +25,29 @@ LogFn = Callable[[str, str], None]
 # 各间隔对应的秒数，供调度器判断任务是否到期
 INTERVAL_SECONDS = {
     "1m": 60,
+    "5m": 5 * 60,
+    "15m": 15 * 60,
     "30m": 30 * 60,
     "hourly": 60 * 60,
     "6h": 6 * 60 * 60,
     "daily": 24 * 60 * 60,
 }
+
+INTERVAL_LABELS = {
+    "1m": "每 1 分钟",
+    "5m": "每 5 分钟",
+    "15m": "每 15 分钟",
+    "30m": "每 30 分钟",
+    "hourly": "每小时",
+    "6h": "每 6 小时",
+    "daily": "每天",
+}
+
+# 新建任务可选的频率（1m 仍兼容旧任务，但不再推荐：每分钟全量枚举极易触发风控）
+INTERVAL_CHOICES = ["5m", "15m", "30m", "hourly", "6h", "daily"]
+
+# 连续失败后的退避：等待时间 = 间隔 × 2^失败次数，最长 1 小时
+MAX_BACKOFF_SECONDS = 60 * 60
 
 # 广告关键词默认值（文件名命中即视为广告垃圾文件）
 DEFAULT_AD_KEYWORDS = (
@@ -33,7 +55,13 @@ DEFAULT_AD_KEYWORDS = (
     "广告\n免费领\n资料群\n客服\n淘宝\n拼多多\n谨防\n防走丢\n更多资源"
 )
 
+STAGE_DIR_NAME = "_pan_auto_tmp_"
+
 EMPTY = {"transferred": 0, "skipped": 0, "renamed": 0, "error": ""}
+
+
+def interval_label(key: str) -> str:
+    return INTERVAL_LABELS.get(key, key or "")
 
 
 def _noop(level: str, msg: str) -> None:
@@ -43,6 +71,19 @@ def _noop(level: str, msg: str) -> None:
 # 正在运行的任务 id（供任务列表显示"运行中"）。跨线程读写，加锁。
 _RUNNING_LOCK = threading.Lock()
 _RUNNING_IDS: set = set()
+# 全局串行锁：所有转存任务串行执行（防风控 + 防止同目录并发建目录）
+_GLOBAL_RUN_LOCK = threading.Lock()
+
+
+def _try_mark_running(task_id) -> bool:
+    """原子地把任务标记为运行中；已在运行返回 False。"""
+    if task_id is None:
+        return True
+    with _RUNNING_LOCK:
+        if task_id in _RUNNING_IDS:
+            return False
+        _RUNNING_IDS.add(task_id)
+        return True
 
 
 def set_task_running(task_id, on: bool) -> None:
@@ -53,6 +94,11 @@ def set_task_running(task_id, on: bool) -> None:
             _RUNNING_IDS.add(task_id)
         else:
             _RUNNING_IDS.discard(task_id)
+
+
+def is_task_running(task_id) -> bool:
+    with _RUNNING_LOCK:
+        return task_id in _RUNNING_IDS
 
 
 def running_task_ids() -> set:
@@ -70,21 +116,28 @@ def _result(transferred=0, skipped=0, renamed=0, error="") -> dict:
 
 
 # ---- 调度辅助 ----
+def effective_period(task: dict) -> int:
+    """任务的实际等待秒数：基础间隔 × 失败退避倍数。"""
+    period = INTERVAL_SECONDS.get(task.get("interval"), INTERVAL_SECONDS["daily"])
+    fails = int(task.get("fail_count") or 0)
+    if fails > 0:
+        period = min(period * (2 ** min(fails, 6)), max(period, MAX_BACKOFF_SECONDS))
+    return period
+
+
 def is_task_due(task: dict, now: Optional[float] = None) -> bool:
-    """任务是否到期该跑（按 interval 与 last_run）。"""
+    """任务是否到期该跑（按 interval 与 last_run，连续失败会指数退避）。"""
     now = now or time.time()
     last = task.get("last_run") or 0
-    period = INTERVAL_SECONDS.get(task.get("interval"), INTERVAL_SECONDS["daily"])
-    return (now - last) >= period
+    return (now - last) >= effective_period(task)
 
 
 def next_run_ts(task: dict) -> int:
-    """任务下次运行的时间戳（last_run + 间隔）；从未跑过返回 0。"""
+    """任务下次运行的时间戳（last_run + 实际间隔）；从未跑过返回 0。"""
     last = task.get("last_run") or 0
     if not last:
         return 0
-    period = INTERVAL_SECONDS.get(task.get("interval"), INTERVAL_SECONDS["daily"])
-    return int(last) + period
+    return int(last) + effective_period(task)
 
 
 # ---- 广告过滤 ----
@@ -157,14 +210,29 @@ def _enumerate_leaf_deep(
 
 # ---- 分发入口 ----
 def run_task(task: dict, log: Optional[LogFn] = None) -> dict:
-    """执行一个任务，返回统计 {transferred, skipped, renamed, error}。"""
+    """执行一个任务，返回统计 {transferred, skipped, renamed, error}。
+
+    - 同一任务不可重入：正在跑时再次调用直接返回（不报错、不写库）。
+    - 所有任务全局串行：调度器与「立即同步」互不打架。
+    - 无论成败都会更新 last_run；失败累计 fail_count 触发退避，成功清零。
+    """
     tid = task.get("id")
-    set_task_running(tid, True)
+    if not _try_mark_running(tid):
+        return _result(error="任务正在运行中，本次跳过")
     try:
-        kind = task.get("kind", "share")
-        if kind in ("friend", "group"):
-            return _run_msg_task(task, log)
-        return _run_share_task(task, log)
+        with _GLOBAL_RUN_LOCK:
+            kind = task.get("kind", "share")
+            try:
+                if kind in ("friend", "group"):
+                    res = _run_msg_task(task, log)
+                else:
+                    res = _run_share_task(task, log)
+            except Exception as e:  # noqa: BLE001  兜底：任何未预期异常都不能让调度器崩
+                db.add_log("error", f"任务执行异常：{e}", tid)
+                res = _result(error=str(e))
+            db.set_task_last_run(tid)
+            db.bump_task_fail_count(tid, failed=bool(res.get("error")))
+            return res
     finally:
         set_task_running(tid, False)
 
@@ -227,8 +295,7 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
         new_items.append(f)
 
     if not new_items:
-        emit("skip", f"[{name_tag}] 无新增文件（跳过 {skipped} 项）")
-        db.set_task_last_run(task_id)
+        _quiet_done(emit, name_tag, skipped)
         return _result(skipped=skipped)
 
     transferred = 0
@@ -248,7 +315,7 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
 
     # 分享接口按选中项转存，但广告文件夹本身仍可能已在目标目录或由服务端
     # 连带写入；百度客户端支持递归删除命中广告词的文件夹及其所有内容。
-    if ad_kw and hasattr(client, "purge_ad_items"):
+    if transferred and ad_kw and hasattr(client, "purge_ad_items"):
         try:
             removed = client.purge_ad_items(target_ref, ad_kw, ad_wl)
             if removed:
@@ -257,7 +324,6 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
             emit("error", f"[{name_tag}] 广告清理失败：{e}")
 
     _summary(emit, name_tag, transferred, skipped, renamed, errors)
-    db.set_task_last_run(task_id)
     return _result(transferred, skipped, renamed, "; ".join(errors))
 
 
@@ -265,6 +331,16 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
 # 好友消息 / 群文件转存（仅百度）
 # ==========================================================================
 def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
+    """好友 / 群 / 群「具体文件夹」同步。
+
+    ★统一走「中转目录」：`mbox/msg/transfer` 无视 fsidlist、总是把整条消息整包倒进
+    目标，且 `ondup=newcopy` 会在已有同名项时生成 `(1)(2)` 副本。所以三种任务都：
+      1. 先整包转存到一个**空的**中转目录 `target/_pan_auto_tmp_<任务id>`；
+      2. 在中转目录里删掉广告；
+      3. 把内容**合并移动**进最终目录（同名文件夹递归合并、同名文件跳过保留旧的）；
+      4. 删掉整个中转目录。
+    最终目录跨次同步固定，增量就是就地更新，永远不会再长出副本文件夹。
+    """
     log = log or _noop
     task_id = task.get("id")
     kind = task["kind"]
@@ -277,6 +353,9 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
     if client is None:
         emit("error", "该任务绑定的账号未登录或已删除")
         return _result(error="账号不可用")
+    if not hasattr(client, "transfer_friend_files"):
+        emit("error", "好友/群同步仅支持百度网盘账号")
+        return _result(error="账号类型不支持")
 
     entity = task.get("entity_id")
     name_tag = task.get("note") or task.get("entity_name") or entity or ""
@@ -285,78 +364,41 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
         return _result(error="未绑定好友/群")
 
     # 群"具体文件夹"任务：转存后要去掉百度自动重建的外层壳，落到叶子文件夹本身
+    leaf_ref = _folder_ref(task.get("link")) if kind == "group" else None
     leaf_rel = ""
     try:
         if kind == "friend":
             messages = client.list_friend_files(entity)
+        elif leaf_ref:
+            direct = client.list_msg_folder(
+                leaf_ref["from_uk"], leaf_ref["msg_id"], leaf_ref["fs_id"], entity
+            )
+            # 直接子项的 path 去掉自身名即叶子文件夹路径（用于中转后定位叶子）
+            for ch in direct:
+                p = ch.get("path") or ""
+                if "/" in p.strip("/"):
+                    leaf_rel = "/" + p.strip("/").rsplit("/", 1)[0]
+                    break
+            # ★递归遍历叶子下所有层级：深层子文件夹内新增的文件也能被增量发现
+            all_items = _enumerate_leaf_deep(
+                client, leaf_ref["from_uk"], leaf_ref["msg_id"], entity, direct
+            )
+            messages = [
+                {"msg_id": leaf_ref["msg_id"], "from_uk": leaf_ref["from_uk"], "files": all_items}
+            ]
         else:
-            # 群任务：link 里可能带"具体文件夹"引用，只同步该文件夹；否则整群
-            ref = _folder_ref(task.get("link"))
-            if ref:
-                direct = client.list_msg_folder(
-                    ref["from_uk"], ref["msg_id"], ref["fs_id"], entity
-                )
-                # 直接子项的 path 去掉自身名即叶子文件夹路径（用于中转后定位叶子）
-                for ch in direct:
-                    p = ch.get("path") or ""
-                    if "/" in p.strip("/"):
-                        leaf_rel = "/" + p.strip("/").rsplit("/", 1)[0]
-                        break
-                # ★递归遍历叶子下所有层级：深层子文件夹内新增的文件也能被增量发现
-                all_items = _enumerate_leaf_deep(
-                    client, ref["from_uk"], ref["msg_id"], entity, direct
-                )
-                messages = [
-                    {"msg_id": ref["msg_id"], "from_uk": ref["from_uk"], "files": all_items}
-                ]
-            else:
-                messages = client.list_group_files(entity)
+            messages = client.list_group_files(entity)
     except Exception as e:  # noqa: BLE001
         emit("error", f"[{name_tag}] 拉取文件消息失败：{e}")
-        return _result(error=str(e))
-
-    target_dir = task.get("target_dir") or "/"
-    try:
-        target_ref = client.resolve_target(target_dir)
-    except Exception as e:  # noqa: BLE001
-        emit("error", f"[{name_tag}] 目标目录处理失败：{e}")
         return _result(error=str(e))
 
     ad_kw = ad_keywords() if task.get("ad_skip") else []
     ad_wl = ad_whitelist() if task.get("ad_skip") else []
     rules = db.list_rules(None) if task.get("rename_on") else []
 
-    # 群「具体文件夹」任务：百度转存无视 fsidlist、总把整条消息整包倒进目标目录，
-    # 且 ondup=newcopy 会在正式目录里生成 (1)(2) 副本。所以先整包转存到一个**空的**
-    # 中转目录，再把叶子文件夹内容并入固定的 target/<叶子名>（就地更新），最后删中转目录。
-    staged = (
-        kind == "group"
-        and _folder_ref(task.get("link")) is not None
-        and hasattr(client, "extract_leaf")
-    )
-    stage_dir = None
-    dest_ref = target_ref
-    if staged:
-        stage_dir = target_ref.rstrip("/") + "/_pan_auto_tmp_"
-        try:
-            # 清掉上次异常残留的中转目录，保证它是空的（否则 ondup 又会生成副本）
-            if client.dir_exists(stage_dir):
-                dr = client.delete_files([stage_dir])
-                if dr.get("taskid"):
-                    client.wait_task(dr["taskid"])
-            client.ensure_dir(stage_dir)
-            dest_ref = stage_dir
-        except Exception as e:  # noqa: BLE001
-            emit("error", f"[{name_tag}] 中转目录准备失败，退回直接转存：{e}")
-            staged = False
-            dest_ref = target_ref
-
-    transferred = 0
+    # 先做去重/去广告筛选，没有新东西就不碰网盘（不建目录、不建中转目录）
     skipped = 0
-    renamed = 0
-    errors = []
-    staged_new_files = []  # 暂存已转存的叶子顶层子项，供中转→落盘后再改名
-
+    pending = []  # [(msg, new_files)]
     for msg in messages:
         new_files = []
         for f in msg["files"]:
@@ -369,18 +411,45 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
                 skipped += 1
                 continue
             new_files.append(f)
-        if not new_files:
-            continue
+        if new_files:
+            pending.append((msg, new_files))
 
+    if not pending:
+        _quiet_done(emit, name_tag, skipped)
+        return _result(skipped=skipped)
+
+    target_dir = task.get("target_dir") or "/"
+    try:
+        target_ref = client.resolve_target(target_dir)
+    except Exception as e:  # noqa: BLE001
+        emit("error", f"[{name_tag}] 目标目录处理失败：{e}")
+        return _result(error=str(e))
+
+    # 准备一个空的中转目录（每个任务独立，避免同目录多任务互相干扰）
+    stage_dir = f"{target_ref.rstrip('/')}/{STAGE_DIR_NAME}{task_id or ''}"
+    try:
+        if client.dir_exists(stage_dir):
+            client.delete_and_wait([stage_dir])  # 清掉上次异常残留，保证为空
+        client.ensure_dir(stage_dir)
+    except Exception as e:  # noqa: BLE001
+        emit("error", f"[{name_tag}] 中转目录准备失败：{e}")
+        return _result(error=str(e))
+
+    transferred = 0
+    renamed = 0
+    errors = []
+    landed = []  # 成功转存的文件（落盘后再按规则改名）
+
+    for msg, new_files in pending:
         fsids = [f["fs_id"] for f in new_files]
         try:
             if kind == "friend":
                 res = client.transfer_friend_files(
-                    msg["from_uk"], msg["msg_id"], fsids, dest_ref
+                    msg["from_uk"], msg["msg_id"], fsids, stage_dir
                 )
             else:
                 res = client.transfer_group_files(
-                    entity, msg["from_uk"], msg["msg_id"], fsids, dest_ref
+                    entity, msg["from_uk"], msg["msg_id"], fsids, stage_dir
                 )
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
@@ -390,7 +459,7 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
         errno = res.get("errno")
         # errno=12 且一个都没转（total/target_file_nums=0）：这些文件你网盘里已存在，
         # 百度全盘去重拒绝重复转存（常见：你自己分享到群的文件、或早已同步过的文件）。
-        # 标记为已处理并软跳过——否则「每分钟」这类高频任务会永远重试、每次报错刷屏、狂打接口。
+        # 标记为已处理并软跳过——否则高频任务会永远重试、每次报错刷屏、狂打接口。
         if errno == 12 and not (res.get("total") or res.get("target_file_nums")):
             for f in new_files:
                 db.mark_transferred(
@@ -415,42 +484,41 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
                 task_id, f"{kind}_{entity}_{f['fs_id']}", f["server_filename"]
             )
             transferred += 1
-            if staged:
-                # 文件此刻在中转目录深处，改名要等落盘到最终叶子目录后再做
-                staged_new_files.append(f)
-            else:
-                renamed += _maybe_rename(client, target_ref, f, rules, name_tag, emit)
+            landed.append(f)
         time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
 
-    # 群「具体文件夹」任务：把中转目录里的叶子内容并入 target/<叶子名>（就地更新），删中转目录
-    if staged and stage_dir:
-        if transferred:
-            try:
-                # 群转存接口会无视 fsidlist 整包倒入中转目录；在合并到正式目录
-                # 前递归删掉命中广告词的文件夹（整棵删除）和文件。
-                if ad_kw and hasattr(client, "purge_ad_items"):
-                    removed = client.purge_ad_items(stage_dir, ad_kw, ad_wl)
-                    if removed:
-                        emit("info", f"[{name_tag}] 已清理 {removed} 个广告文件/文件夹")
-                leaf_final = client.extract_leaf(stage_dir, target_ref, leaf_rel)
-                emit("info", f"[{name_tag}] 已整理到 → {leaf_final}")
-                for f in staged_new_files:  # 落盘后在最终目录里按规则改名并记日志
-                    renamed += _maybe_rename(client, leaf_final, f, rules, name_tag, emit)
-            except Exception as e:  # noqa: BLE001
-                emit("error", f"[{name_tag}] 目录整理失败（文件已转存到中转目录，未落盘）：{e}")
-                errors.append(f"目录整理失败：{e}")
-        else:
-            # 无新增：清掉刚建的空中转目录，别在网盘里留垃圾
-            try:
+    # 中转 → 最终目录
+    final_dir = target_ref
+    if transferred:
+        try:
+            if ad_kw:
+                removed = client.purge_ad_items(stage_dir, ad_kw, ad_wl)
+                if removed:
+                    emit("info", f"[{name_tag}] 已清理 {removed} 个广告文件/文件夹")
+            if leaf_ref:
+                final_dir = client.extract_leaf(stage_dir, target_ref, leaf_rel)
+            else:
+                client.merge_move_into(stage_dir, target_ref)
                 if client.dir_exists(stage_dir):
-                    dr = client.delete_files([stage_dir])
-                    if dr.get("taskid"):
-                        client.wait_task(dr["taskid"])
-            except Exception:  # noqa: BLE001
-                pass
+                    client.delete_and_wait([stage_dir])
+            emit("info", f"[{name_tag}] 已整理到 → {final_dir}")
+            for f in landed:  # 落盘后在最终目录里按规则改名并记日志
+                renamed += _maybe_rename(client, final_dir, f, rules, name_tag, emit)
+        except Exception as e:  # noqa: BLE001
+            emit(
+                "error",
+                f"[{name_tag}] 目录整理失败（文件已在中转目录 {stage_dir}，下次同步会先清掉它）：{e}",
+            )
+            errors.append(f"目录整理失败：{e}")
+    else:
+        # 一个都没转成功：清掉刚建的空中转目录，别在网盘里留垃圾
+        try:
+            if client.dir_exists(stage_dir):
+                client.delete_and_wait([stage_dir])
+        except Exception:  # noqa: BLE001
+            pass
 
     _summary(emit, name_tag, transferred, skipped, renamed, errors)
-    db.set_task_last_run(task_id)
     return _result(transferred, skipped, renamed, "; ".join(errors))
 
 
@@ -474,11 +542,16 @@ def _maybe_rename(client, target_ref, f, rules, name_tag, emit) -> int:
         return 0
 
 
+def _quiet_done(emit, name_tag, skipped):
+    """没有新增时只记一条简短的跳过记录，避免高频任务刷屏。"""
+    emit("skip", f"[{name_tag}] 无新增（已同步 {skipped} 项）")
+
+
 def _summary(emit, name_tag, transferred, skipped, renamed, errors):
     summary = f"[{name_tag}] 完成：新增 {transferred}，跳过 {skipped}，改名 {renamed}"
     if errors:
         summary += f"，失败 {len(errors)}"
-    emit("info", summary)
+    emit("error" if errors else "info", summary)
 
 
 def _chunks(seq, n):

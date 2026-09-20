@@ -1,33 +1,24 @@
 """网盘文件浏览器：列出当前账号网盘里的文件 / 文件夹，可进入子目录。
 
-用于验证「能否获取网盘文件」，同时给自动转存提供目标文件夹选择。
-列目录在后台线程进行，避免界面卡顿。
+给自动转存 / 重命名 / 广告页选择目标文件夹用；列目录在后台线程进行。
 """
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QListWidget,
     QListWidgetItem,
     QAbstractItemView,
+    QLineEdit,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 
+from app import theme
 from app.netdisk import get_client_for_account
 from app.quark.client import display_path, is_quark_path
 from app.ui.icons import make_icon
-
-
-def _fmt_size(n: int) -> str:
-    if not n:
-        return ""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
+from app.ui.widgets import icon_button, ElidedLabel, fmt_size
 
 
 class ListWorker(QThread):
@@ -45,8 +36,7 @@ class ListWorker(QThread):
             self.error.emit("未登录")
             return
         try:
-            items = client.list_dir(self.path)
-            self.done.emit(items)
+            self.done.emit(client.list_dir(self.path))
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
 
@@ -61,6 +51,7 @@ class NetdiskBrowser(QWidget):
         self.cwd = "/"
         self._history: list[str] = []
         self.account_id = None
+        self._items: list[dict] = []
         # 保留所有在跑的线程引用，直到它们 finished，避免 QThread 运行中被 GC
         # 销毁（Qt 会 abort 进程）。_seq 用于只采纳最后一次加载的结果。
         self._workers: list[ListWorker] = []
@@ -70,19 +61,21 @@ class NetdiskBrowser(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
 
-        # 工具行：当前路径 + 上级 + 刷新
         bar = QHBoxLayout()
-        self.up_btn = QPushButton(" 上级")
-        self.up_btn.setObjectName("Ghost")
-        self.up_btn.setIcon(make_icon("up", "#4a5365", 15))
+        bar.setSpacing(6)
+        self.up_btn = icon_button("arrow-left", theme.TEXT_2, "上一级")
         self.up_btn.clicked.connect(self.go_up)
         bar.addWidget(self.up_btn)
-        self.path_label = QLabel("/")
-        self.path_label.setStyleSheet("color:#2f6bff; font-weight:600;")
+        self.path_label = ElidedLabel("/", mode=Qt.ElideMiddle)
+        self.path_label.setStyleSheet(f"color:{theme.PRIMARY}; font-weight:600;")
         bar.addWidget(self.path_label, 1)
-        self.refresh_btn = QPushButton(" 刷新")
-        self.refresh_btn.setObjectName("Ghost")
-        self.refresh_btn.setIcon(make_icon("refresh", "#4a5365", 15))
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("筛选当前目录…")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.setFixedWidth(170)
+        self.filter.textChanged.connect(lambda _t: self._render())
+        bar.addWidget(self.filter)
+        self.refresh_btn = icon_button("refresh", theme.TEXT_2, "刷新")
         self.refresh_btn.clicked.connect(self.reload)
         bar.addWidget(self.refresh_btn)
         root.addLayout(bar)
@@ -90,15 +83,18 @@ class NetdiskBrowser(QWidget):
         self.list = QListWidget()
         self.list.setIconSize(QSize(18, 18))
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setFrameShape(QListWidget.NoFrame)
+        self.list.setStyleSheet(f"QListWidget{{border:1px solid {theme.BORDER}; border-radius:8px; padding:4px;}}")
         self.list.itemDoubleClicked.connect(self._on_double)
         root.addWidget(self.list, 1)
 
         self.status = QLabel("")
-        self.status.setObjectName("Muted")
+        self.status.setObjectName("Hint")
         root.addWidget(self.status)
+        self._folder_icon = make_icon("folder", "#F0A93B", 18)
+        self._file_icon = make_icon("file", theme.MUTED_2, 18)
 
     def set_account(self, account_id):
-        """切换浏览的账号并刷新到根目录。"""
         self.account_id = account_id
         self._history.clear()
         self.load("/")
@@ -110,12 +106,12 @@ class NetdiskBrowser(QWidget):
         self.selected_changed.emit(shown)
         self.up_btn.setEnabled(bool(self._history) or self.cwd != "/")
         self.list.clear()
+        self._items = []
         self.status.setText("加载中…")
         self.refresh_btn.setEnabled(False)
         self._seq += 1
         seq = self._seq
         worker = ListWorker(self.cwd, self.account_id)
-        # 只采纳最后一次加载的结果，旧线程结果忽略但仍等它自然结束
         worker.done.connect(lambda items, s=seq: s == self._seq and self._on_loaded(items))
         worker.error.connect(lambda msg, s=seq: s == self._seq and self._on_error(msg))
         worker.finished.connect(lambda w=worker: self._drop_worker(w))
@@ -143,21 +139,27 @@ class NetdiskBrowser(QWidget):
 
     def _on_loaded(self, items: list):
         self.refresh_btn.setEnabled(True)
+        self._items = items
+        self._render()
+
+    def _render(self):
         self.list.clear()
+        q = self.filter.text().strip().lower()
+        items = [i for i in self._items if not q or q in (i.get("server_filename") or "").lower()]
         dirs = [i for i in items if i.get("isdir")]
         files = [i for i in items if not i.get("isdir")]
-        folder_icon = make_icon("folder", "#f0a93b", 18)
-        file_icon = make_icon("file", "#9aa4b5", 18)
         for it in dirs:
-            li = QListWidgetItem(folder_icon, f"  {it['server_filename']}")
+            li = QListWidgetItem(self._folder_icon, it["server_filename"])
             li.setData(Qt.UserRole, it)
+            li.setToolTip(it["server_filename"])
             self.list.addItem(li)
         for it in files:
-            size = _fmt_size(it.get("size", 0))
-            li = QListWidgetItem(file_icon, f"  {it['server_filename']}    {size}")
+            size = fmt_size(it.get("size", 0))
+            li = QListWidgetItem(self._file_icon, f"{it['server_filename']}    {size}")
             li.setData(Qt.UserRole, it)
+            li.setToolTip(it["server_filename"])
             self.list.addItem(li)
-        self.status.setText(f"共 {len(dirs)} 个文件夹，{len(files)} 个文件")
+        self.status.setText(f"{len(dirs)} 个文件夹，{len(files)} 个文件" + ("（已筛选）" if q else "") + " · 双击进入文件夹")
 
     def _on_error(self, msg: str):
         self.refresh_btn.setEnabled(True)
@@ -170,6 +172,7 @@ class NetdiskBrowser(QWidget):
         data = item.data(Qt.UserRole)
         if data and data.get("isdir"):
             self._history.append(self.cwd)
+            self.filter.clear()
             self.load(data["path"])
 
     def current_dir(self) -> str:

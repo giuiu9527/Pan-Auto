@@ -2,18 +2,16 @@
 
 关键词与「自动同步」的去广告共用同一份配置（app_settings.ad_keywords）。
 """
+import re
 from collections import deque
 
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QScrollArea,
-    QLabel,
     QLineEdit,
     QComboBox,
     QCheckBox,
-    QPushButton,
     QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
@@ -22,30 +20,22 @@ from PySide6.QtWidgets import (
     QStackedWidget,
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor
 
-from app.ui.widgets import card, field_group, field_label, label
+from app import db
+from app import theme
+from app.core.transfer import DEFAULT_AD_KEYWORDS
+from app.netdisk import get_client_for_account, account_display_name
+from app.quark.client import display_path
 from app.ui.icons import make_icon
 from app.ui.netdisk_browser import NetdiskBrowser
-from app.netdisk import get_client_for_account, account_display_name
-from app.core.transfer import DEFAULT_AD_KEYWORDS
-from app import db
-
-
-def _fmt_size(n: int) -> str:
-    if not n:
-        return ""
-    x = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if x < 1024:
-            return f"{x:.0f}{unit}" if unit == "B" else f"{x:.1f}{unit}"
-        x /= 1024
-    return f"{x:.1f}PB"
+from app.ui.widgets import (
+    card, field_group, button, square_button, icon_button, input_with_button,
+    PageHeader, TwoColumn, scroll_wrap, setup_table, table_frame, fmt_size,
+    EmptyState, label,
+)
 
 
 def _parse_keywords(raw: str) -> list[str]:
-    import re
-
     return [k.strip() for k in re.split(r"[\n,，]", raw or "") if k.strip()]
 
 
@@ -75,23 +65,16 @@ class ScanWorker(QThread):
                 cur = q.popleft()
                 scanned += 1
                 self.progress.emit(f"扫描中… 已查 {scanned} 个目录，命中 {len(matched)}")
-                items = client.list_dir(cur)
-                for it in items:
+                for it in client.list_dir(cur):
                     name = it.get("server_filename", "")
                     low = name.lower()
                     if any(w in low for w in self.whitelist):
-                        continue  # 白名单：保留，不清理
+                        continue
                     if any(k in low for k in self.keywords):
-                        matched.append(
-                            {
-                                "name": name,
-                                "path": it.get("path", ""),
-                                "size": it.get("size", 0),
-                                "dir": cur,
-                                "isdir": bool(it.get("isdir")),
-                            }
-                        )
-                        # 命中文件夹时删整个子树，无需继续扫描里面的项。
+                        matched.append({
+                            "name": name, "path": it.get("path", ""), "size": it.get("size", 0),
+                            "dir": cur, "isdir": bool(it.get("isdir")),
+                        })
                         continue
                     if it.get("isdir") and self.recursive and it.get("path"):
                         q.append(it["path"])
@@ -116,13 +99,13 @@ class DeleteWorker(QThread):
         try:
             res = client.delete_files(self.paths)
             errno = res.get("errno")
-            self.done.emit(
-                {
-                    "ok": errno in (0, None),
-                    "error": res.get("message", "") if errno not in (0, None) else "",
-                    "count": len(self.paths),
-                }
-            )
+            if errno in (0, None) and res.get("taskid") and hasattr(client, "wait_task"):
+                client.wait_task(res["taskid"])
+            self.done.emit({
+                "ok": errno in (0, None),
+                "error": res.get("message", "") if errno not in (0, None) else "",
+                "count": len(self.paths),
+            })
         except Exception as e:  # noqa: BLE001
             self.done.emit({"ok": False, "error": str(e)})
 
@@ -130,178 +113,141 @@ class DeleteWorker(QThread):
 class AdCleanPage(QWidget):
     def __init__(self):
         super().__init__()
-        self.folder = "/"
         self._workers = []
+        self._matched = []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(TwoColumn(self._build_form(), self._build_right(), left_width=440))
+        self.refresh_accounts()
 
-        columns = QHBoxLayout(self)
-        columns.setContentsMargins(0, 0, 0, 0)
-        columns.setSpacing(0)
-
-        # ===== 左：表单 =====
+    def _build_form(self) -> QWidget:
         left = QWidget()
-        left.setFixedWidth(438)
-        columns.addWidget(left)
-        left_lay = QVBoxLayout(left)
-        left_lay.setContentsMargins(22, 14, 16, 16)
-        left_lay.setSpacing(11)
+        lay = QVBoxLayout(left)
+        lay.setContentsMargins(24, 20, 10, 20)
+        lay.setSpacing(12)
+        lay.addWidget(PageHeader("广告清理", "扫描文件夹里命中关键词的文件 / 文件夹，勾选后删除"))
 
-        title = QLabel("广告清理")
-        title.setObjectName("PageTitle")
-        left_lay.addWidget(title)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        left_lay.addWidget(scroll, 1)
         body = QWidget()
-        scroll.setWidget(body)
-        root = QVBoxLayout(body)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(11)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(12)
 
         form = card()
         fl = QVBoxLayout(form)
-        fl.setContentsMargins(18, 16, 18, 16)
-        fl.setSpacing(12)
+        fl.setContentsMargins(18, 16, 18, 18)
+        fl.setSpacing(14)
 
         self.account = QComboBox()
-        fl.addWidget(field_group("账号 *", self.account))
+        fl.addWidget(field_group("账号", self.account))
 
-        dir_widget = QWidget()
-        dr = QHBoxLayout(dir_widget)
-        dr.setContentsMargins(0, 0, 0, 0)
-        dr.setSpacing(8)
         self.folder_edit = QLineEdit("/")
-        dr.addWidget(self.folder_edit, 1)
-        pick = QPushButton()
-        pick.setObjectName("Ghost")
-        pick.setIcon(make_icon("folder", "#4a5365", 16))
-        pick.setFixedSize(42, 40)
-        pick.setToolTip("浏览网盘选择文件夹")
+        pick = square_button("folder", "浏览网盘选择文件夹")
         pick.clicked.connect(self.pick_folder)
-        dr.addWidget(pick)
-        fl.addWidget(field_group("要清理的文件夹 *", dir_widget))
+        fl.addWidget(field_group("要清理的文件夹", input_with_button(self.folder_edit, pick)))
 
-        self.recursive = QCheckBox("包括子文件夹（递归扫描）")
+        self.recursive = QCheckBox("包括子文件夹（递归扫描，最多 1000 个目录）")
         self.recursive.setChecked(True)
         fl.addWidget(self.recursive)
 
-        fl.addWidget(field_label("广告关键词（命中即视为广告文件/文件夹）"))
-        fl.addWidget(label("一行一个或用逗号分隔；与「自动同步」的去广告共用。", "Muted"))
         self.kw_input = QPlainTextEdit()
         self.kw_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
-        self.kw_input.setMaximumHeight(110)
-        fl.addWidget(self.kw_input)
+        self.kw_input.setFixedHeight(110)
+        fl.addWidget(field_group("广告关键词", self.kw_input,
+                                 "一行一个或用逗号分隔，文件名命中即视为广告；与「自动同步」的去广告共用。"))
 
-        fl.addWidget(field_label("白名单关键词（命中则保留，绝不清理）"))
-        fl.addWidget(label("保护你自己插入的广告：文件名含这些词就不删、不跳过。", "Muted"))
         self.wl_input = QPlainTextEdit()
         self.wl_input.setPlainText(db.get_setting("ad_whitelist", ""))
-        self.wl_input.setMaximumHeight(80)
+        self.wl_input.setFixedHeight(72)
         self.wl_input.setPlaceholderText("如：我的公众号名、你的推广品牌…")
-        fl.addWidget(self.wl_input)
+        fl.addWidget(field_group("白名单关键词", self.wl_input,
+                                 "命中白名单的文件绝不清理、也不跳过，用来保护你自己插入的广告。"))
 
-        save_kw = QPushButton("保存关键词/白名单")
-        save_kw.setObjectName("Ghost")
-        save_kw.clicked.connect(self.save_keywords)
         kwrow = QHBoxLayout()
         kwrow.addStretch()
+        save_kw = button("保存关键词 / 白名单", "Ghost", "check")
+        save_kw.clicked.connect(self.save_keywords)
         kwrow.addWidget(save_kw)
         fl.addLayout(kwrow)
-        fl.addStretch()
-        root.addWidget(form)
+        bl.addWidget(form)
+        bl.addStretch()
+        lay.addWidget(scroll_wrap(body), 1)
 
-        self.scan_btn = QPushButton("  扫描广告文件")
-        self.scan_btn.setObjectName("Primary")
-        self.scan_btn.setMinimumHeight(44)
-        self.scan_btn.setCursor(Qt.PointingHandCursor)
-        self.scan_btn.setIcon(make_icon("search", "#ffffff", 16))
+        self.scan_btn = button("扫描广告文件", "PrimaryLarge", "search")
         self.scan_btn.clicked.connect(self.scan)
-        left_lay.addWidget(self.scan_btn)
+        lay.addWidget(self.scan_btn)
+        return left
 
-        # ===== 右：结果 / 目录选择 =====
+    def _build_right(self) -> QWidget:
         self.right_stack = QStackedWidget()
-        columns.addWidget(self.right_stack, 1)
         self.right_stack.addWidget(self._build_result_page())
         self.right_stack.addWidget(self._build_folder_page())
-
-        self.refresh_accounts()
+        return self.right_stack
 
     def _build_result_page(self) -> QWidget:
         page = QWidget()
         rl = QVBoxLayout(page)
-        rl.setContentsMargins(6, 14, 20, 16)
-        rl.setSpacing(10)
-        head = QHBoxLayout()
-        t = QLabel("命中的广告文件/文件夹")
-        t.setObjectName("PageTitle")
-        head.addWidget(t)
-        head.addStretch()
-        self.status = QLabel("先选文件夹，点「扫描广告文件」")
-        self.status.setObjectName("Muted")
-        head.addWidget(self.status)
-        rl.addLayout(head)
+        rl.setContentsMargins(10, 20, 24, 20)
+        rl.setSpacing(12)
+        self.header = PageHeader("命中的广告文件", "先选文件夹，点「扫描广告文件」")
+        rl.addWidget(self.header)
+
+        self.result_stack = QStackedWidget()
+        self.empty = EmptyState("eraser", "还没有扫描", "扫描结果会列在这里，默认全选，取消勾选可保留")
+        self.result_stack.addWidget(self.empty)
 
         c = card()
         cl = QVBoxLayout(c)
-        cl.setContentsMargins(6, 6, 6, 6)
+        cl.setContentsMargins(8, 8, 8, 8)
+        cl.setSpacing(8)
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["文件/文件夹名", "大小", "所在目录"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setShowGrid(False)
+        self.table.setHorizontalHeaderLabels(["文件 / 文件夹", "大小", "所在目录"])
+        setup_table(self.table, row_height=38)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        cl.addWidget(self.table)
-        rl.addWidget(c, 1)
-
+        self.table.setColumnWidth(1, 90)
+        cl.addWidget(self.table, 1)
         foot = QHBoxLayout()
-        sel = QPushButton("全选")
-        sel.setObjectName("Ghost")
+        foot.setSpacing(8)
+        sel = button("全选", "Ghost")
         sel.clicked.connect(lambda: self._check_all(True))
-        clr = QPushButton("全不选")
-        clr.setObjectName("Ghost")
+        clr = button("全不选", "Ghost")
         clr.clicked.connect(lambda: self._check_all(False))
         foot.addWidget(sel)
         foot.addWidget(clr)
-        foot.addStretch()
-        self.del_btn = QPushButton("  删除选中")
-        self.del_btn.setObjectName("Danger")
-        self.del_btn.setIcon(make_icon("trash", "#e5484d", 16))
+        self.status = label("", "Hint")
+        foot.addWidget(self.status, 1)
+        self.del_btn = button("删除选中", "Danger", "trash")
         self.del_btn.clicked.connect(self.delete_selected)
         foot.addWidget(self.del_btn)
-        rl.addLayout(foot)
+        cl.addLayout(foot)
+        self.result_stack.addWidget(c)
+        rl.addWidget(self.result_stack, 1)
         return page
 
     def _build_folder_page(self) -> QWidget:
         page = QWidget()
         rl = QVBoxLayout(page)
-        rl.setContentsMargins(6, 14, 20, 16)
-        rl.setSpacing(10)
-        head = QHBoxLayout()
-        t = QLabel("选择文件夹")
-        t.setObjectName("PageTitle")
-        head.addWidget(t)
-        head.addStretch()
-        close = QPushButton("✕")
-        close.setObjectName("IconBtn")
-        close.setFixedSize(30, 28)
+        rl.setContentsMargins(10, 20, 24, 20)
+        rl.setSpacing(12)
+        head = PageHeader("选择文件夹", "双击进入文件夹，选好后点「使用此文件夹」")
+        close = icon_button("x", theme.TEXT_2, "返回")
         close.clicked.connect(lambda: self.right_stack.setCurrentIndex(0))
-        head.addWidget(close)
-        rl.addLayout(head)
+        head.add_action(close)
+        rl.addWidget(head)
         c = card()
         cl = QVBoxLayout(c)
         cl.setContentsMargins(14, 12, 14, 12)
-        cl.setSpacing(8)
+        cl.setSpacing(10)
         self.browser = NetdiskBrowser()
-        cl.addWidget(self.browser)
-        use = QPushButton("  使用此文件夹")
-        use.setObjectName("Primary")
-        use.setIcon(make_icon("check", "#ffffff", 16))
+        cl.addWidget(self.browser, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        use = button("使用此文件夹", "Primary", "check")
         use.clicked.connect(self._use_folder)
-        cl.addWidget(use)
+        row.addWidget(use)
+        cl.addLayout(row)
         rl.addWidget(c, 1)
         return page
 
@@ -323,9 +269,7 @@ class AdCleanPage(QWidget):
     def save_keywords(self):
         db.set_setting("ad_keywords", self.kw_input.toPlainText().strip())
         db.set_setting("ad_whitelist", self.wl_input.toPlainText().strip())
-        QMessageBox.information(
-            self, "已保存", "广告关键词与白名单已更新（自动同步的去广告也会用）。"
-        )
+        QMessageBox.information(self, "已保存", "广告关键词与白名单已更新，自动同步的去广告也会使用。")
 
     # ---- 目录选择 ----
     def pick_folder(self):
@@ -357,9 +301,9 @@ class AdCleanPage(QWidget):
         self.right_stack.setCurrentIndex(0)
         self.table.setRowCount(0)
         self.scan_btn.setEnabled(False)
-        self.status.setText("扫描中…")
+        self.header.set_subtitle("扫描中…")
         w = ScanWorker(acc_id, self.folder_edit.text().strip() or "/", kws, self.recursive.isChecked(), wl)
-        w.progress.connect(self.status.setText)
+        w.progress.connect(self.header.set_subtitle)
         w.done.connect(self._on_scanned)
         w.error.connect(self._on_scan_error)
         w.finished.connect(lambda x=w: self._drop(x))
@@ -370,24 +314,30 @@ class AdCleanPage(QWidget):
         self.scan_btn.setEnabled(True)
         self._matched = matched
         self.table.setRowCount(0)
-        for f in matched:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
+        self.table.setRowCount(len(matched))
+        folder_icon = make_icon("folder", "#F0A93B", 16)
+        file_icon = make_icon("file", theme.MUTED_2, 16)
+        for r, f in enumerate(matched):
             it = QTableWidgetItem(f["name"])
+            it.setIcon(folder_icon if f.get("isdir") else file_icon)
+            it.setToolTip(f["name"])
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked)
             it.setData(Qt.UserRole, f)
             self.table.setItem(r, 0, it)
-            self.table.setItem(r, 1, QTableWidgetItem(_fmt_size(f.get("size", 0))))
-            from app.quark.client import display_path
-            self.table.setItem(r, 2, QTableWidgetItem(display_path(f.get("dir", ""))))
-        self.status.setText(f"命中 {len(matched)} 个广告文件/文件夹（默认全选，可取消不删的）")
+            self.table.setItem(r, 1, QTableWidgetItem("文件夹" if f.get("isdir") else fmt_size(f.get("size", 0))))
+            d = QTableWidgetItem(display_path(f.get("dir", "")))
+            d.setToolTip(display_path(f.get("dir", "")))
+            self.table.setItem(r, 2, d)
+        self.result_stack.setCurrentIndex(1)
+        self.header.set_subtitle(f"命中 {len(matched)} 个广告文件 / 文件夹")
+        self.status.setText("默认全选，取消勾选可保留" if matched else "")
         if not matched:
             QMessageBox.information(self, "扫描完成", "没有命中广告关键词的文件或文件夹。")
 
     def _on_scan_error(self, msg: str):
         self.scan_btn.setEnabled(True)
-        self.status.setText(f"扫描失败：{msg}")
+        self.header.set_subtitle(f"扫描失败：{msg}")
         QMessageBox.warning(self, "扫描失败", msg)
 
     def _check_all(self, checked: bool):
@@ -409,9 +359,7 @@ class AdCleanPage(QWidget):
         if not paths:
             QMessageBox.warning(self, "提示", "请先勾选要删除的文件")
             return
-        if QMessageBox.question(
-            self, "确认删除", f"将永久删除选中的 {len(paths)} 个文件，确定？"
-        ) != QMessageBox.Yes:
+        if QMessageBox.question(self, "确认删除", f"将删除选中的 {len(paths)} 项（进入网盘回收站），确定？") != QMessageBox.Yes:
             return
         self.del_btn.setEnabled(False)
         self.status.setText("删除中…")
@@ -424,9 +372,11 @@ class AdCleanPage(QWidget):
     def _on_deleted(self, result: dict):
         self.del_btn.setEnabled(True)
         if result.get("ok"):
-            QMessageBox.information(self, "完成", f"已删除 {result.get('count', 0)} 个广告文件。")
-            self.scan()  # 重新扫描刷新
+            db.add_log("info", f"广告清理：已删除 {result.get('count', 0)} 项")
+            QMessageBox.information(self, "完成", f"已删除 {result.get('count', 0)} 项。")
+            self.scan()
         else:
+            self.status.setText("")
             QMessageBox.warning(self, "删除失败", result.get("error") or "未知错误")
 
     def _drop(self, w):

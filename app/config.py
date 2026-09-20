@@ -1,13 +1,36 @@
-"""全局配置与路径。"""
+"""全局配置与路径。
+
+版本号唯一来源是仓库根目录的 `VERSION` 文件（打包时随 datas 进入 `_internal/VERSION`）。
+构建（exe 的 VERSIONINFO）、包名、update.json 全部从它读，见 `Pan-Auto.spec` 与 `ci/win/*.ps1`。
+"""
+import os
+import sys
 from pathlib import Path
 
 APP_NAME = "Pan-Auto"
 APP_TITLE = "Pan-Auto · 网盘自动转存"
-APP_VERSION = "V2.6"
+
+
+def _read_version() -> str:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        candidates += [base / "VERSION", Path(sys.executable).parent / "VERSION"]
+    candidates.append(Path(__file__).resolve().parents[1] / "VERSION")
+    for p in candidates:
+        try:
+            v = p.read_text(encoding="utf-8").strip()
+            if v:
+                return v.lstrip("vV")
+        except OSError:
+            continue
+    return "0.0.0"
+
+
+APP_VERSION_PLAIN = _read_version()     # 3.0.0（比较 / 打包 / 清单用）
+APP_VERSION = "V" + APP_VERSION_PLAIN   # V3.0.0（界面显示用）
 
 # 用户数据目录：%APPDATA%\Pan-Auto （Windows）
-import os
-
 _base = os.environ.get("APPDATA") or str(Path.home())
 DATA_DIR = Path(_base) / APP_NAME
 DATA_DIR.mkdir(parents=True, exist_ok=True)

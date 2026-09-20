@@ -1,73 +1,120 @@
-"""转存记录页：展示运行日志。"""
-import time
-
+"""运行记录页：按级别筛选 + 关键字搜索 + 清空。"""
 from PySide6.QtWidgets import (
     QWidget,
-    QVBoxLayout,
     QHBoxLayout,
-    QLabel,
+    QLineEdit,
     QPushButton,
+    QButtonGroup,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QMessageBox,
 )
 from PySide6.QtGui import QColor
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from app import db
+from app import theme
+from app.ui.widgets import (
+    page_root, PageHeader, button, setup_table, table_frame, pill_cell, fmt_time,
+)
 
-LEVEL_COLORS = {
-    "ok": "#16a34a",
-    "skip": "#a16207",
-    "error": "#dc2626",
-    "info": "#2563eb",
-}
+LEVELS = [
+    ("", "全部"),
+    ("ok", "成功"),
+    ("info", "信息"),
+    ("skip", "跳过"),
+    ("error", "失败"),
+]
+LEVEL_KIND = {"ok": "success", "skip": "warning", "error": "danger", "info": "info"}
 LEVEL_TEXT = {"ok": "成功", "skip": "跳过", "error": "失败", "info": "信息"}
 
 
 class LogsPage(QWidget):
     def __init__(self):
         super().__init__()
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 18, 24, 18)
-        root.setSpacing(10)
+        self.level = ""
+        root = page_root(self)
 
-        head = QHBoxLayout()
-        title = QLabel("转存记录")
-        title.setObjectName("PageTitle")
-        head.addWidget(title)
-        head.addStretch()
-        refresh = QPushButton("刷新")
-        refresh.setObjectName("Ghost")
+        self.header = PageHeader("运行记录", "每次同步 / 改名 / 清理的详细结果，最新在最上面")
+        refresh = button("刷新", "Ghost", "refresh")
         refresh.clicked.connect(self.reload)
-        head.addWidget(refresh)
-        root.addLayout(head)
+        self.header.add_action(refresh)
+        clear = button("清空记录", "Danger", "trash")
+        clear.clicked.connect(self.clear_all)
+        self.header.add_action(clear)
+        root.addWidget(self.header)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.chip_group = QButtonGroup(self)
+        self.chip_group.setExclusive(True)
+        for key, text in LEVELS:
+            b = QPushButton(text)
+            b.setObjectName("Chip")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setChecked(key == "")
+            b.clicked.connect(lambda _=False, k=key: self.set_level(k))
+            self.chip_group.addButton(b)
+            bar.addWidget(b)
+        bar.addSpacing(10)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索记录内容…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(320)
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(250)
+        self._debounce.timeout.connect(self.reload)
+        self.search.textChanged.connect(lambda _t: self._debounce.start())
+        bar.addWidget(self.search, 1)
+        bar.addStretch()
+        root.addLayout(bar)
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["时间", "状态", "内容"])
-        self.table.verticalHeader().setVisible(False)
+        setup_table(self.table, row_height=36)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        root.addWidget(self.table)
+        self.table.setColumnWidth(0, 150)
+        self.table.setColumnWidth(1, 86)
+        root.addWidget(table_frame(self.table), 1)
 
         self.reload()
 
+    def on_shown(self):
+        self.reload()
+
+    def set_level(self, key: str):
+        self.level = key
+        self.reload()
+
     def reload(self):
-        logs = db.list_logs(300)
+        logs = db.list_logs(400, self.level or None, self.search.text().strip())
         self.table.setRowCount(0)
-        for lg in logs:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(lg["ts"]))
-            self.table.setItem(r, 0, QTableWidgetItem(ts))
-            lvl = QTableWidgetItem(LEVEL_TEXT.get(lg["level"], lg["level"]))
-            lvl.setForeground(QColor(LEVEL_COLORS.get(lg["level"], "#374151")))
-            self.table.setItem(r, 1, lvl)
-            self.table.setItem(r, 2, QTableWidgetItem(lg["message"]))
-        if not logs:
-            self.table.setRowCount(1)
-            empty = QTableWidgetItem("暂无记录")
-            empty.setForeground(QColor("#9ca3af"))
-            self.table.setItem(0, 2, empty)
+        self.table.setRowCount(len(logs))
+        for r, lg in enumerate(logs):
+            ts = QTableWidgetItem(fmt_time(lg["ts"], "%Y-%m-%d %H:%M:%S"))
+            ts.setForeground(QColor(theme.MUTED))
+            self.table.setItem(r, 0, ts)
+            lvl = lg["level"]
+            self.table.setCellWidget(r, 1, pill_cell(LEVEL_TEXT.get(lvl, lvl), LEVEL_KIND.get(lvl, "muted")))
+            text = (lg["message"] or "").replace("⏱ ", "").replace("⏱", "")
+            msg = QTableWidgetItem(text)
+            msg.setToolTip(text)
+            if lvl == "error":
+                msg.setForeground(QColor(theme.DANGER))
+            self.table.setItem(r, 2, msg)
+        self.header.set_subtitle(
+            f"显示最近 {len(logs)} 条" + ("（已筛选）" if self.level or self.search.text().strip() else "")
+            + "，最新在最上面"
+        )
+
+    def clear_all(self):
+        if QMessageBox.question(self, "清空记录", "确定清空全部运行记录？（不影响去重记录）") != QMessageBox.Yes:
+            return
+        db.clear_logs()
+        self.reload()

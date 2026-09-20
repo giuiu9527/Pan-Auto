@@ -1,6 +1,6 @@
-"""群文件夹选择器（仿 NeoPan 下拉）。
+"""群文件夹选择器（下拉弹窗）。
 
-点击网盘图标弹出：群列表 → 点群进入群文件根目录 → 逐级点进文件夹 →
+点击按钮弹出：群列表 → 双击群进入群文件根目录 → 逐级双击进文件夹 →
 「同步此文件夹」选定当前/选中的文件夹（或整群）。选定后发出 picked 信号。
 
 发出的字典：
@@ -12,14 +12,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QListWidget,
     QListWidgetItem,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 
+from app import theme
 from app.baidu.client import get_client_for_account
 from app.ui.icons import make_icon
+from app.ui.widgets import icon_button, button, ElidedLabel
 
 
 class _Worker(QThread):
@@ -45,63 +46,60 @@ class GroupPickerPopup(QFrame):
         self.account_id = account_id
         self._alive = True
         self._workers = []
-        # 导航状态
         self.gid = ""
         self.gname = ""
-        self.crumbs = []          # 从群根到当前目录的名称路径
-        self.folder_ref = None    # 当前所在文件夹 {msg_id, from_uk, fs_id}
-        self.selected = None      # 单击选中的文件夹 {msg_id, from_uk, fs_id, name}
-        self._history = []        # 返回栈：(level, gid, gname, crumbs, folder_ref)
-        self.level = "groups"     # groups / grouproot / folder
+        self.crumbs = []
+        self.folder_ref = None
+        self.selected = None
+        self._history = []
+        self.level = "groups"
 
         self.setObjectName("Card")
-        self.setFixedSize(420, 360)
+        self.setFixedSize(480, 420)
         self.setStyleSheet(
-            "QFrame#Card{background:#fff;border:1px solid #e5e9f0;border-radius:10px;}"
+            f"QFrame#Card{{background:{theme.CARD};border:1px solid {theme.BORDER_STRONG};border-radius:12px;}}"
         )
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
+        root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
 
         head = QHBoxLayout()
-        self.back_btn = QPushButton(" 返回")
-        self.back_btn.setObjectName("Ghost")
-        self.back_btn.setIcon(make_icon("up", "#4a5365", 14))
+        head.setSpacing(6)
+        self.back_btn = icon_button("arrow-left", theme.TEXT_2, "返回上一级")
         self.back_btn.clicked.connect(self.go_back)
         self.back_btn.hide()
         head.addWidget(self.back_btn)
-        self.title = QLabel("百度群组（点群进文件夹）")
-        self.title.setStyleSheet("font-weight:600; color:#2f6bff;")
+        self.title = ElidedLabel("选择百度群", mode=Qt.ElideMiddle)
+        self.title.setStyleSheet(f"font-weight:600; color:{theme.TEXT};")
         head.addWidget(self.title, 1)
-        refresh = QPushButton()
-        refresh.setObjectName("IconBtn")
-        refresh.setIcon(make_icon("refresh", "#4a5365", 14))
-        refresh.setFixedSize(26, 24)
+        refresh = icon_button("refresh", theme.TEXT_2, "刷新")
         refresh.clicked.connect(self._reload_current)
         head.addWidget(refresh)
         root.addLayout(head)
 
         self.list = QListWidget()
         self.list.setIconSize(QSize(16, 16))
+        self.list.setStyleSheet(f"QListWidget{{border:1px solid {theme.BORDER}; border-radius:8px; padding:4px;}}")
         self.list.itemClicked.connect(self._on_click)
         self.list.itemDoubleClicked.connect(self._on_double)
         root.addWidget(self.list, 1)
 
+        self.hint = QLabel("双击群进入；单击选中文件夹，双击进入下级")
+        self.hint.setObjectName("Hint")
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+
         foot = QHBoxLayout()
-        self.hint = QLabel("单击选文件夹，双击进下级")
-        self.hint.setObjectName("Muted")
-        self.hint.setStyleSheet("color:#8b95a7; font-size:12px;")
-        foot.addWidget(self.hint)
         foot.addStretch()
-        self.use_btn = QPushButton("同步此文件夹")
-        self.use_btn.setObjectName("Primary")
+        self.use_btn = button("同步此文件夹", "Primary", "check")
         self.use_btn.clicked.connect(self._confirm)
         self.use_btn.setEnabled(False)
         foot.addWidget(self.use_btn)
         root.addLayout(foot)
 
-        self._folder_icon = make_icon("folder", "#f0a93b", 16)
-        self._file_icon = make_icon("file", "#9aa4b5", 16)
+        self._folder_icon = make_icon("folder", "#F0A93B", 16)
+        self._file_icon = make_icon("file", theme.MUTED_2, 16)
+        self._group_icon = make_icon("users", "#7C3AED", 16)
         self._load_groups()
 
     # ---- 数据加载 ----
@@ -121,8 +119,9 @@ class GroupPickerPopup(QFrame):
     def _load_groups(self):
         self.level = "groups"
         self.back_btn.hide()
-        self.title.setText("百度群组（点群进文件夹）")
+        self.title.setText("选择百度群")
         self.use_btn.setEnabled(False)
+        self.use_btn.setText("同步此文件夹")
         self.selected = None
 
         def fn():
@@ -138,11 +137,10 @@ class GroupPickerPopup(QFrame):
             return
         self.list.clear()
         for g in groups:
-            it = QListWidgetItem("  " + g["name"])
-            it.setIcon(make_icon("users", "#6b7a90", 16))
+            it = QListWidgetItem(self._group_icon, g["name"])
             it.setData(Qt.UserRole, {"type": "group", "gid": g["gid"], "gname": g["name"]})
             self.list.addItem(it)
-        self.hint.setText(f"共 {len(groups)} 个群，点群进入")
+        self.hint.setText(f"共 {len(groups)} 个群，双击进入群文件")
 
     def _load_group_root(self, gid, gname):
         self.level = "grouproot"
@@ -153,12 +151,12 @@ class GroupPickerPopup(QFrame):
         self.selected = None
         self.back_btn.show()
         self.title.setText(gname)
-        self.use_btn.setEnabled(True)  # 可"同步整群"
+        self.use_btn.setEnabled(True)
+        self.use_btn.setText("同步整群")
 
         def fn():
             c = self._client()
             msgs = c.list_group_files(gid)
-            # 展平：每个文件带其消息的 msg_id/from_uk
             out = []
             for m in msgs:
                 for f in m["files"]:
@@ -175,6 +173,7 @@ class GroupPickerPopup(QFrame):
         self.back_btn.show()
         self.title.setText(" / ".join(self.crumbs))
         self.use_btn.setEnabled(True)
+        self.use_btn.setText("同步当前文件夹")
 
         def fn():
             c = self._client()
@@ -190,16 +189,14 @@ class GroupPickerPopup(QFrame):
         dirs = [i for i in items if i.get("isdir")]
         files = [i for i in items if not i.get("isdir")]
         for f in dirs:
-            it = QListWidgetItem("  " + f["server_filename"])
-            it.setIcon(self._folder_icon)
+            it = QListWidgetItem(self._folder_icon, f["server_filename"])
             it.setData(Qt.UserRole, {"type": "folder", "item": f})
             self.list.addItem(it)
         for f in files:
-            it = QListWidgetItem("  " + f["server_filename"])
-            it.setIcon(self._file_icon)
+            it = QListWidgetItem(self._file_icon, f["server_filename"])
             it.setData(Qt.UserRole, {"type": "file", "item": f})
             self.list.addItem(it)
-        self.hint.setText(f"{len(dirs)} 个文件夹，{len(files)} 个文件")
+        self.hint.setText(f"{len(dirs)} 个文件夹，{len(files)} 个文件 · 单击选中文件夹，双击进入")
 
     # ---- 交互 ----
     def _on_click(self, item):
@@ -211,9 +208,14 @@ class GroupPickerPopup(QFrame):
                 "fs_id": f["fs_id"], "name": f["server_filename"],
             }
             self.use_btn.setEnabled(True)
+            self.use_btn.setText("同步选中文件夹")
             self.hint.setText(f"已选：{f['server_filename']}（双击可进入）")
         else:
             self.selected = None
+            if self.level == "folder":
+                self.use_btn.setText("同步当前文件夹")
+            elif self.level == "grouproot":
+                self.use_btn.setText("同步整群")
 
     def _on_double(self, item):
         data = item.data(Qt.UserRole) or {}
@@ -245,7 +247,6 @@ class GroupPickerPopup(QFrame):
             self._load_group_root(gid, gname)
         else:
             self.gid, self.gname = gid, gname
-            # 回到某层文件夹：crumbs 已含到该层，folder_ref 为该层
             self.crumbs = crumbs[:-1] if crumbs else []
             self._load_folder(folder_ref, crumbs[-1] if crumbs else "")
 
@@ -260,7 +261,7 @@ class GroupPickerPopup(QFrame):
             self._load_folder(self.folder_ref, name)
 
     def _confirm(self):
-        if self.selected:  # 选中了某个文件夹
+        if self.selected:
             ref = self.selected
             display = " / ".join(self.crumbs + [ref["name"]])
             self.picked.emit({
@@ -268,14 +269,14 @@ class GroupPickerPopup(QFrame):
                 "msg_id": ref["msg_id"], "from_uk": ref["from_uk"], "fs_id": ref["fs_id"],
                 "display": display,
             })
-        elif self.level == "folder" and self.folder_ref:  # 当前所在文件夹
+        elif self.level == "folder" and self.folder_ref:
             self.picked.emit({
                 "gid": self.gid, "gname": self.gname,
                 "msg_id": self.folder_ref["msg_id"], "from_uk": self.folder_ref["from_uk"],
                 "fs_id": self.folder_ref["fs_id"],
                 "display": " / ".join(self.crumbs),
             })
-        elif self.level == "grouproot":  # 整群
+        elif self.level == "grouproot":
             self.picked.emit({"gid": self.gid, "gname": self.gname, "display": self.gname + "（整群）"})
         else:
             return

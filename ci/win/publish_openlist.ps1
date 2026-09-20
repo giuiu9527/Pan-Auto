@@ -156,7 +156,11 @@ try {
 
 # ---- 6. 自检：脚本报成功 ≠ 客户端能更新 ----
 Write-Host "==> 自检公开链接" -ForegroundColor Cyan
-$pubManifest = & curl.exe -sS "$publicBase/update.json" | ConvertFrom-Json
+# curl 的 UTF-8 输出直接进管道会被 PS5.1 按 GBK 解码、中文变乱码导致 JSON 解析失败：先落盘再按 UTF-8 读
+$pubFile = Join-Path ([IO.Path]::GetTempPath()) 'Pan-Auto-public-update.json'
+& curl.exe -sS -o $pubFile "$publicBase/update.json"
+$pubManifest = (Read-Utf8 $pubFile) | ConvertFrom-Json
+Remove-Item $pubFile -Force -ErrorAction SilentlyContinue
 if ($pubManifest.version -ne $version -or $pubManifest.archive -ne "$packageName.zip") {
     throw "公开链接上的 update.json 不对：version=$($pubManifest.version) archive=$($pubManifest.archive)"
 }

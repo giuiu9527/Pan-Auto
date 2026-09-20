@@ -16,12 +16,12 @@
 
 服务端目录：OpenList `http://209.146.116.186:5244` 的 `/Pan-Auto`（已建好，和 `/IMM-Touping-Next` 平级，脚本里写死，**不读 `OPENLIST_UPDATE_PATH`**）。账号密码在用户环境变量 `OPENLIST_USERNAME` / `OPENLIST_PASSWORD`，不进源码、不进日志、不进包。
 
-## 二、首次启用（只做一次）
+## 二、首次接入（已完成，记录做法）
 
-1. 在 OpenList 网页登录 → 根目录 → 进入 `Pan-Auto` → 分享 → 只读、不设密码、不设过期 → 复制得到 `http://209.146.116.186:5244/sd/xxxxxxxx/`。
-2. 把它填进 `app/update_client.py` 的 `UPDATE_PUBLIC_BASE`（末尾带 `/`）。
-3. 跑 `.\release.ps1 -Version 3.0.0`（或先 `package.ps1` 再 `publish_openlist.ps1`）。
-4. **首次要手动把 zip 发给用户**：旧版（V2.6 及以前）没有 `update.exe`，无法自动升上来；从这一版起以后的版本都能点「检查更新」自动升级。
+1. `POST /api/fs/mkdir {"path":"/Pan-Auto"}` 建目录（普通 fs 接口用相对路径）。
+2. `POST /api/share/create` 建公开分享。**`files` 必须写账号真实根路径下的绝对路径** `/谷歌云盘/软件收集/myAPP/Pan-Auto`（`GET /api/me` 的 `base_path` 是 `/谷歌云盘/软件收集/myAPP`），否则 permission denied。其余字段：`expires` 2099、`pwd` 空、`disabled` false、`extract_folder` front。
+3. `GET /api/share/list` 找到它的 `id`（本项目 `xIitmuVC`），公开链接 `http://209.146.116.186:5244/sd/xIitmuVC/`，填进 `app/update_client.py` 的 `UPDATE_PUBLIC_BASE`。分享目录本身 `/sd/xxx/` 访问 500 是正常的，只有文件路径才 200。
+4. **首次要手动把 zip 发给用户**：旧版（V2.6 及以前）没有 `update.exe`，无法自动升上来；从 3.0.0 起以后的版本都能点「检查更新」自动升级。
 
 ## 三、每次发版
 

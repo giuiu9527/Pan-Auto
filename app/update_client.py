@@ -28,7 +28,9 @@ from app.config import APP_NAME, APP_VERSION_PLAIN
 # ★ OpenList 上 /Pan-Auto 目录的公开只读分享链接（在 OpenList 网页手动开分享后填入）。
 #   清单 = 该链接 + update.json；下载 = 该链接 + 清单里的 archive；校验 = 下载地址 + .sha256
 #   发布脚本 ci/win/publish_openlist.ps1 会从这里读取同一个值做发布后自检，别在两处各写一份。
-UPDATE_PUBLIC_BASE = ""  # TODO: 形如 "http://209.146.116.186:5244/sd/xxxxxxxx/"，开好分享后填入
+#   分享 id xIitmuVC：通过 POST /api/share/create 建的（files 必须写账号真实根路径下的绝对路径
+#   /谷歌云盘/软件收集/myAPP/Pan-Auto），公开 / 只读 / 无密码 / 2099 到期。
+UPDATE_PUBLIC_BASE = "http://209.146.116.186:5244/sd/xIitmuVC/"
 # 开发调试可用环境变量临时指到本地 http.server（发布包里不要设置它）
 _ENV_OVERRIDE = "PAN_AUTO_UPDATE_BASE"
 

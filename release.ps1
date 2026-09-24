@@ -53,10 +53,11 @@ if (-not $SkipPush) {
     $dirty = (TryExec { git diff --cached --quiet }) -ne 0
     if ($dirty) {
         Exec { git commit -m "Release v$Version" } 'git commit 失败'
-        Exec { git push origin main } 'git push 失败'
     } else {
         Write-Host '没有需要提交的改动' -ForegroundColor Yellow
     }
+    # 即使本次没有新提交，本地也可能已领先远端（先手动 commit 过），一律推送
+    Exec { git push origin main } 'git push 失败'
 }
 
 # ---- 3. 打包 ----

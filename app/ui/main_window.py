@@ -416,6 +416,13 @@ class MainWindow(QWidget):
         self._really_quit = True
         self.close()
 
+    def on_ipc_command(self, cmd: str):
+        """来自另一份启动 / 更新器的命令：show = 唤到前台；quit = 正常退出（收托盘、停调度器）。"""
+        if cmd == "show":
+            self._show_window()
+        elif cmd == "quit":
+            self._quit_from_tray()
+
     def _notify_tray_once(self):
         if self._tray_notified or not hasattr(self, "tray"):
             return

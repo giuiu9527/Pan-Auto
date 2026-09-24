@@ -195,6 +195,7 @@ app/ui/
 - **GitHub 仓库保持 public**（用户明确要求）。仓库：`loadingkuu/Pan-Auto`。
 - 改动后：`py_compile` → 离屏冒烟/截图（打桩网络）→ `pythonw main.py` 实跑 → 需要时用真实账号打接口验证。改动转存/目录逻辑后，**必须**在隔离目录（如 `/_pan_auto_selftest`）用真实账号跑一遍「建中转目录 → copy 文件进去 → purge_ad_items → extract_leaf/merge_move_into → 校验最终目录无副本 → 删除」的自检，别只看日志。
 - **在线更新 / 发版**：OpenList 方案（`D:\Test Code\软件包更新方式.md`），步骤见 `docs/UPDATE.md`。版本号唯一来源 `VERSION`；`app/update_client.py`（协议）+ `updater_main.py`/`app/ui/updater_window.py`（独立 `update.exe`）；`ci/win/package.ps1` 打包、`ci/win/publish_openlist.ps1` 发布、`release.ps1` 一键。远端目录写死 `/Pan-Auto`，公开分享 `/sd/xIitmuVC/` 是用 `POST /api/share/create` 自己建的（`files` 要写绝对路径 `/谷歌云盘/软件收集/myAPP/Pan-Auto`，账号 base_path 不是 `/`），链接只写在 `update_client.UPDATE_PUBLIC_BASE`（发布脚本从源码解析同一值）。旧的 GitHub Releases 更新器（`app/updater.py`）已删除。
+- **单实例 / 进程间命令**（`app/single_instance.py`，V3.0.1）：GUI 用 QLocalServer（Windows 命名管道 `\\.\pipe\PanAuto-GUI-<用户名>`）做单实例，第二次启动只发 `show` 给已运行实例然后退出；`update.exe` 覆盖文件前先往管道写 `quit` 让主程序正常退出（自己收托盘、停调度器），6 秒等不到才 `taskkill /F`。★挂机机器托盘里「一堆图标」的两个来源：V2.5 以前每次定时任务新建托盘图标（旧 bug）；被强杀的进程留下的幽灵图标。`app/tray_cleanup.py` 用 WM_MOUSEMOVE 扫托盘工具栏清幽灵图标，**只对 Win10 有效**——Win11 的托盘是 XAML（Shell_TrayWnd 下没有 ToolbarWindow32），无公开 API，只能靠鼠标划过。
 - `main.py` 还带 `--headless`（只跑调度器）和 `--api <cmd>`（`app/api_bridge.py`，给外部原生 UI 的一次性 JSON 桥）两种模式，是用户为另一个项目加的，改 `run_task`/客户端签名时别把它们弄坏。
 - 不要把 Cookie / Token 写进代码或提交。
 

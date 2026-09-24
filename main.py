@@ -107,6 +107,18 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 
+    # 单实例：已有一份在跑就把它唤到前台，本进程直接退出（否则两个托盘图标、两个调度器）
+    from app.single_instance import SingleInstance
+
+    guard = SingleInstance(app)
+    if not guard.try_acquire():
+        return 0
+
+    # 清掉上次被强杀留下的幽灵托盘图标
+    from app.tray_cleanup import refresh_tray_icons
+
+    refresh_tray_icons()
+
     # 字体：更平滑的渲染
     font = QFont("Microsoft YaHei", 10)
     font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
@@ -118,9 +130,13 @@ def main() -> int:
     init_db()
 
     window = MainWindow()
+    guard.command.connect(window.on_ipc_command)
     window.show()
     QTimer.singleShot(1500, window.check_updates_on_startup)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":

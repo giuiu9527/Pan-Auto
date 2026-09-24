@@ -43,7 +43,7 @@
 4. 有新版本 → 显示 `当前 → 新版本` + `notes`，等用户点「立即更新」。
 5. 下载到 `%TEMP%\Pan-Auto-update\`（先 `.part` 再改名），有进度，可取消。
 6. `GET` 同名 `.sha256` 比对，不一致删 zip 报错。
-7. `taskkill /F /IM Pan-Auto.exe`。
+7. 先通过命名管道（`app/single_instance.py`）让主程序**正常退出**（收托盘图标、停调度器），6 秒内没退再 `taskkill /F /IM Pan-Auto.exe`。强杀会在通知区留幽灵图标，Win11 上程序无法自动清理。
 8. 写临时 `.bat`（UTF-8 **带 BOM**，`chcp 65001`），用 **`cmd.exe /c`** 启动，失败弹窗；自己退出。
 9. `.bat`：等旧进程退出 → `Expand-Archive` 到临时目录 → `xcopy /Y /E /H /C /I` 覆盖程序目录 → `start Pan-Auto.exe` → 删 zip 和自己。输出在程序目录 `update.log`。
 

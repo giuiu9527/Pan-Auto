@@ -265,13 +265,34 @@ def _win_flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
-def kill_main_program() -> None:
-    """杀主程序及其会锁文件的子进程（登录子进程也是同一个 exe）。"""
+def _main_program_running() -> bool:
+    if sys.platform != "win32":
+        return False
+    p = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {MAIN_EXE_NAME}", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, creationflags=_win_flags(), stdin=subprocess.DEVNULL,
+    )
+    return MAIN_EXE_NAME.lower() in (p.stdout or "").lower()
+
+
+def kill_main_program(grace_seconds: float = 6.0) -> None:
+    """先请主程序正常退出（它会自己收掉托盘图标、停调度器），等不到再强杀。
+
+    直接 taskkill /F 会在通知区留下「幽灵托盘图标」，挂机机器上每更新一次多一个。
+    """
     if sys.platform != "win32":
         return
-    for image in (MAIN_EXE_NAME,):
+    from app.single_instance import graceful_quit_running_instance_raw
+
+    if _main_program_running() and graceful_quit_running_instance_raw():
+        deadline = time.time() + grace_seconds
+        while time.time() < deadline:
+            if not _main_program_running():
+                break
+            time.sleep(0.3)
+    if _main_program_running():
         subprocess.run(
-            ["taskkill", "/F", "/IM", image],
+            ["taskkill", "/F", "/IM", MAIN_EXE_NAME],
             capture_output=True, creationflags=_win_flags(), stdin=subprocess.DEVNULL,
         )
 

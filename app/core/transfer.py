@@ -280,6 +280,10 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
     ad_wl = ad_whitelist() if task.get("ad_skip") else []
     rules = db.list_rules(None) if task.get("rename_on") else []
 
+    # 能列分享子目录的客户端（百度）走「递归逐文件」模式；夸克沿用下面按顶层条目的老逻辑
+    if hasattr(client, "list_share_dir"):
+        return _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, emit)
+
     # 去重 + 去广告
     new_items = []
     skipped = 0
@@ -328,6 +332,179 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
 
     _summary(emit, name_tag, transferred, skipped, renamed, errors)
     return _result(transferred, skipped, renamed, "; ".join(errors))
+
+
+# 递归枚举分享时最多列多少个目录（防超大分享把接口打爆）；超出的目录本次不处理并写警告
+SHARE_MAX_DIRS = 400
+
+
+def _mirror_dir(target_dir: str, rel: tuple) -> str:
+    base = (target_dir or "/").rstrip("/")
+    return base + "/" + "/".join(rel) if rel else (base or "/")
+
+
+def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl):
+    """递归枚举分享里的所有文件，返回 (groups, skipped, ad_names, dirs, truncated)。
+
+    groups = {相对目录元组: [新文件项]}，只含「没同步过、不是广告」的文件；
+    命中广告词的文件/文件夹整棵不进入（也不会被转存、不会在目标里建目录）。
+
+    ★兼容老任务：老逻辑把分享根下的顶层文件夹整个转存并按「文件夹自己的 fs_id」记已同步。
+    遇到「自己已被记为已同步」的文件夹，说明它当时是整包进来的，里面现存的文件都按「已同步」
+    处理（只记录、不转存），这样升级后不会把整个分享再拉一遍，只会同步之后新增的文件。
+    """
+    groups: dict = {}
+    skipped = 0
+    ad_names: list[str] = []
+    dirs = 0
+    truncated = False
+
+    root_items = []
+    try:
+        root_items = client.list_share_dir(meta, "")
+    except Exception:  # noqa: BLE001  根目录接口失败 → 用分享页解析出的顶层条目兜底
+        root_items = []
+    if not root_items:
+        root_items = [
+            {**f, "isdir": int(f.get("isdir") or 0),
+             "path": f.get("path") or "/" + f["server_filename"]}
+            for f in meta["files"]
+        ]
+
+    # 「迁移完成」标记：老记录只在第一次递归扫描时当作基线，扫完写 deep_<key>，之后不再生效，
+    # 否则之后新增的文件会被永远当成「老的」而发现不了
+    migrated: list[tuple[str, str]] = []
+
+    # 栈元素：(分享内路径, 相对目标目录的路径, 是否老逻辑已整包同步过, 预取的子项或 None)
+    stack = [("", (), False, root_items)]
+    while stack:
+        path, rel, baseline, items = stack.pop()
+        if items is None:
+            if dirs >= SHARE_MAX_DIRS:
+                truncated = True
+                continue
+            dirs += 1
+            items = client.list_share_dir(meta, path)   # 报错上抛：列不出来不能当成「没文件」
+            time.sleep(0.2)
+        subdirs = []
+        for f in items:
+            name = f["server_filename"]
+            key = client.share_key(meta, f)
+            if ad_kw and is_ad_to_remove(name, ad_kw, ad_wl):
+                if not db.is_transferred(task_id, key):
+                    db.mark_transferred(task_id, key, name)   # 只记一次，之后不再重复提示
+                    ad_names.append(name)
+                skipped += 1
+                continue
+            if int(f.get("isdir") or 0):
+                legacy = db.is_transferred(task_id, key) and not db.is_transferred(task_id, "deep_" + key)
+                if legacy:
+                    migrated.append(("deep_" + key, name))
+                subdirs.append((f.get("path") or "", rel + (name,), baseline or legacy))
+                continue
+            if db.is_transferred(task_id, key):
+                skipped += 1
+                continue
+            if baseline:
+                db.mark_transferred(task_id, key, name)
+                skipped += 1
+                continue
+            groups.setdefault(rel, []).append(f)
+        for sd in reversed(subdirs):          # 反向入栈 → 按名字顺序处理
+            stack.append((sd[0], sd[1], sd[2], None))
+    if not truncated:                         # 完整扫完才算迁移完成
+        for mkey, mname in migrated:
+            db.mark_transferred(task_id, mkey, mname)
+    return groups, skipped, ad_names, dirs, truncated
+
+
+def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, emit) -> dict:
+    """分享链接「递归逐文件」同步（百度）。
+
+    以前只比对分享根下的顶层条目、整个文件夹一起转存：根下只有一个包着所有内容的文件夹时
+    （很常见），等于每次整包转存——广告看不到、文件夹里后来新增的文件也发现不了。
+    现在：递归列出分享里所有文件 → 跳过广告 → 只转存没同步过的文件，并按分享里的层级
+    在目标目录里镜像出同样的文件夹（目录已存在不会另建副本，同名文件跳过不会生成副本）。
+    """
+    task_id = task.get("id")
+    try:
+        groups, skipped, ad_names, dirs, truncated = _scan_share_tree(
+            client, meta, task_id, ad_kw, ad_wl
+        )
+    except Exception as e:  # noqa: BLE001
+        emit("error", f"[{name_tag}] 读取分享目录失败：{e}")
+        return _result(error=str(e))
+    _log_ad_skipped(emit, name_tag, ad_names)
+    if truncated:
+        emit("warn", f"[{name_tag}] 分享里的文件夹太多（超过 {SHARE_MAX_DIRS} 个），"
+                     f"本次只处理了前 {SHARE_MAX_DIRS} 个目录")
+
+    # 词表变了就把新词应用到目标目录里已有的文件上（用户明确保存过自定义词时，首次也算「变了」）；
+    # 只用默认词表且没有历史指纹的老任务首次只记录指纹，不去清理，避免升级后突然删东西
+    sig = adfilter.signature(ad_kw, ad_wl) if ad_kw else ""
+    sig_key = f"ad_sig_{task_id}"
+    stored_sig = db.get_setting(sig_key, "")
+    custom_saved = db.get_setting("ad_keywords", None) is not None
+    sig_changed = bool(ad_kw and stored_sig != sig and (stored_sig or custom_saved))
+
+    transferred = 0
+    renamed = 0
+    errors: list[str] = []
+    for rel, flist in groups.items():
+        dest = _mirror_dir(target_dir, rel)
+        try:
+            if client.dir_exists(dest):
+                existing = {i.get("server_filename") for i in client.list_dir(dest)}
+            else:
+                existing = set()
+                client.resolve_target(dest)     # 建目录；已存在不会生成副本
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+            emit("error", f"[{name_tag}] 处理目录 {dest} 失败：{e}")
+            continue
+        fresh = []
+        for f in flist:
+            if f["server_filename"] in existing:     # 目标里已有同名文件：记为已同步，不重复转存
+                db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
+                skipped += 1
+            else:
+                fresh.append(f)
+        for batch in _chunks(fresh, 100):
+            res = client.save_files(meta, batch, dest)
+            if res.get("error"):
+                errors.append(res["error"])
+                emit("error", f"[{name_tag}] {dest}：{res['error']}")
+                continue
+            for f in batch:
+                db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
+                transferred += 1
+                renamed += _maybe_rename(client, dest, f, rules, name_tag, emit)
+            time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
+
+    # 目标目录里已有的广告：有新转存、或广告词表刚改过时清一遍
+    if ad_kw and (transferred or sig_changed) and hasattr(client, "purge_ad_items"):
+        try:
+            removed_names: list[str] = []
+            n = client.purge_ad_items(_norm_target(target_dir), ad_kw, ad_wl, removed=removed_names)
+            if n:
+                shown = "、".join(removed_names[:8]) + (f" 等 {n} 项" if n > 8 else "")
+                emit("info", f"[{name_tag}] 已清理 {n} 个广告文件/文件夹：{shown}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"广告清理失败：{e}")
+            emit("error", f"[{name_tag}] 广告清理失败：{e}")
+    if ad_kw and not errors:
+        db.set_setting(sig_key, sig)
+
+    if not transferred and not errors:
+        _quiet_done(emit, name_tag, skipped)
+        return _result(skipped=skipped)
+    _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw)
+    return _result(transferred, skipped, renamed, "; ".join(errors))
+
+
+def _norm_target(path: str) -> str:
+    p = (path or "/").strip()
+    return "/" + p.strip("/") if p.strip("/") else "/"
 
 
 # ==========================================================================
@@ -553,10 +730,13 @@ def _quiet_done(emit, name_tag, skipped):
     emit("skip", f"[{name_tag}] 无新增（已同步 {skipped} 项）")
 
 
-def _summary(emit, name_tag, transferred, skipped, renamed, errors):
+def _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw=None):
     summary = f"[{name_tag}] 完成：新增 {transferred}，跳过 {skipped}，改名 {renamed}"
     if errors:
         summary += f"，失败 {len(errors)}"
+    if ad_kw:
+        custom = db.get_setting("ad_keywords", None) is not None
+        summary += f"；本次按 {len(ad_kw)} 个广告词过滤" + ("" if custom else "（默认词表，未保存自定义词）")
     emit("error" if errors else "info", summary)
 
 

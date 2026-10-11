@@ -54,6 +54,15 @@ def contains_any(name: str, keywords: list[str]) -> bool:
     return False
 
 
+def signature(ad_kw: list[str], whitelist: list[str] | None = None) -> str:
+    """关键词 + 白名单的指纹：词表变了就变，用来判断「该把新词应用到已有文件上」。"""
+    import hashlib
+
+    body = "\n".join(sorted({normalize(k) for k in ad_kw if k})) + "\n||\n" + \
+        "\n".join(sorted({normalize(k) for k in (whitelist or []) if k}))
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+
 def is_ad_to_remove(name: str, ad_kw: list[str], whitelist: list[str] | None = None) -> bool:
     """是否应作为广告清理/跳过：命中广告词、且未命中白名单。"""
     if whitelist and contains_any(name, whitelist):

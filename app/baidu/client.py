@@ -243,12 +243,14 @@ class BaiduPanClient:
         return r.json()
 
     def purge_ad_items(
-        self, root: str, ad_kw: list[str], whitelist: list[str] | None = None
+        self, root: str, ad_kw: list[str], whitelist: list[str] | None = None,
+        removed: list | None = None,
     ) -> int:
         """递归删除 ``root`` 内名字命中广告词的文件**和文件夹**。
 
         命中文件夹时直接删整棵子树，不再继续深入；这样群消息转存时被接口
         连带带下来的广告目录不会在最终落盘后残留。
+        ``removed`` 传入一个 list 时，会把被删除项的名字追加进去（供日志展示）。
         """
         if not ad_kw:
             return 0
@@ -275,18 +277,20 @@ class BaiduPanClient:
                 if not path:
                     continue
                 if contains_any(name, keywords):
-                    matches.append(path)
+                    matches.append((path, name))
                 elif item.get("isdir"):
                     pending.append(path)
 
         deleted = 0
         for i in range(0, len(matches), 100):
             batch = matches[i : i + 100]
-            result = self.delete_files(batch)
+            result = self.delete_files([p for p, _ in batch])
             if result.get("taskid"):
                 self.wait_task(result["taskid"])
             if result.get("errno") in (0, None):
                 deleted += len(batch)
+                if removed is not None:
+                    removed.extend(n for _, n in batch)
         return deleted
 
     def wait_task(self, taskid, timeout: float = 120.0) -> dict:
@@ -491,7 +495,32 @@ class BaiduPanClient:
 
         return {"shareid": shareid, "uk": uk, "files": files, "ref": ref}
 
-    def _list_share(self, uk: str, shareid: str, sub_path: str) -> list[dict]:
+    def list_share_dir(self, meta: dict, path: str = "") -> list[dict]:
+        """列分享里某个目录的**直接子项**（自动翻页）；path 为空 = 分享根。
+
+        返回统一结构 {fs_id:int, server_filename, isdir:int, path, size}。
+        接口报错直接上抛（不当成空目录，否则会把「列不出来」误判成「没有文件」）。
+        """
+        raw: list[dict] = []
+        for page in range(1, 21):
+            items = self._list_share(meta["uk"], meta["shareid"], path, page=page)
+            raw.extend(items)
+            if len(items) < 1000:
+                break
+        out = []
+        for it in raw:
+            if it.get("fs_id") is None:
+                continue
+            out.append({
+                "fs_id": int(it["fs_id"]),
+                "server_filename": it.get("server_filename") or "",
+                "isdir": int(it.get("isdir") or 0),
+                "path": it.get("path") or "",
+                "size": it.get("size", 0),
+            })
+        return out
+
+    def _list_share(self, uk: str, shareid: str, sub_path: str, page: int = 1) -> list[dict]:
         params = {
             "uk": uk,
             "shareid": shareid,
@@ -499,7 +528,7 @@ class BaiduPanClient:
             "desc": 0,
             "showempty": 0,
             "web": 1,
-            "page": 1,
+            "page": page,
             "num": 1000,
             "channel": "chunlei",
             "clienttype": 0,

@@ -23,7 +23,7 @@ from app import theme
 from app.core.transfer import (
     run_task, next_run_ts, running_task_ids, is_task_running,
     INTERVAL_CHOICES, INTERVAL_SECONDS, interval_label,
-    ad_keywords, ad_action, ad_action_text,
+    ad_keywords, ad_action, ad_action_text, ad_replacements,
 )
 from app.netdisk import account_display_name
 from app.ui.icons import make_icon
@@ -305,9 +305,13 @@ class AutoSyncPage(QWidget):
         kws = ad_keywords()
         custom = db.get_setting("ad_keywords", None) is not None
         action, text = ad_action(), ad_action_text()
-        how = {"skip": "跳过不转存",
-               "replace": f"把命中的词替换为「{text}」" if text else "删掉命中的词",
-               "rename": f"整个名字改为「{text}」" if text else "改名（未填新名字，按跳过处理）"}[action]
+        if action == "skip":
+            how = "跳过不转存"
+        else:
+            n_rep = len(ad_replacements())
+            fallback = f"整个改成「{text}」" if text else "删掉命中的词"
+            how = (f"改名（{n_rep} 个词有替换内容，其余{fallback}）" if n_rep
+                   else f"改名（{fallback}）")
         src = f"{len(kws)} 个自定义广告词" if custom else f"默认词表 {len(kws)} 个词（还没设置自己的广告词）"
         self.ad_status.setText(f"当前：{src}；命中后{how}")
         self.ad_status.setStyleSheet("" if custom else f"color:{theme.WARNING};")

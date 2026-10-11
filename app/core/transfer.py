@@ -152,13 +152,21 @@ def ad_whitelist() -> list[str]:
 
 
 def ad_action() -> str:
-    """命中广告后的处理方式：skip（跳过/删除）/ replace（替换命中的词）/ rename（整个名字改掉）。"""
+    """命中广告后的处理方式：skip（跳过/删除）/ replace（改名：按词替换，没设置的整个改成兜底名字）。"""
     a = db.get_setting("ad_action", adfilter.ACTION_SKIP)
+    if a == adfilter.ACTION_RENAME:          # 3.0.5 的「整个改名」并入改名模式（兜底名字就是它）
+        return adfilter.ACTION_REPLACE
     return a if a in adfilter.ACTIONS else adfilter.ACTION_SKIP
 
 
 def ad_action_text() -> str:
+    """兜底名字：命中的广告词没设置替换内容时，整个名字改成它。"""
     return db.get_setting("ad_action_text", "")
+
+
+def ad_replacements() -> dict:
+    """广告词里写成 `广告词=替换内容` 的项。"""
+    return adfilter.parse_replacements(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
 
 
 # 匹配规则（全角/半角、空白、I/l/1 混写）统一在 adfilter，这里只做别名保持旧调用不变
@@ -354,14 +362,15 @@ def _mirror_dir(target_dir: str, rel: tuple) -> str:
 
 
 def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl,
-                     action: str = adfilter.ACTION_SKIP, action_text: str = ""):
+                     action: str = adfilter.ACTION_SKIP, action_text: str = "",
+                     replacements: dict | None = None):
     """递归枚举分享里的所有文件，返回 (groups, skipped, ad_names, dirs, truncated)。
 
     groups = {相对目录元组: [新文件项]}，只含「没同步过」的文件；
     命中广告词时按处理方式：
       - 跳过：文件/文件夹整棵不进入（不转存、不在目标里建目录）；
-      - 替换 / 改名：文件夹在目标里直接以**新名字**建出来（内容照常同步），
-        文件照常转存，项里带 ``_final_name``，转存后改成新名字。
+      - 改名（按词替换，没设置替换内容的整个改成兜底名字）：文件夹在目标里直接以**新名字**
+        建出来（内容照常同步），文件照常转存，项里带 ``_final_name``，转存后改成新名字。
 
     ★兼容老任务：老逻辑把分享根下的顶层文件夹整个转存并按「文件夹自己的 fs_id」记已同步。
     遇到「自己已被记为已同步」的文件夹，说明它当时是整包进来的，里面现存的文件都按「已同步」
@@ -405,7 +414,7 @@ def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl,
             name = f["server_filename"]
             key = client.share_key(meta, f)
             isdir = bool(int(f.get("isdir") or 0))
-            final = adfilter.ad_target_name(name, isdir, ad_kw, ad_wl, action, action_text) \
+            final = adfilter.ad_target_name(name, isdir, ad_kw, ad_wl, action, action_text, replacements) \
                 if ad_kw else None
             if final == "":                          # 跳过（或替换后没有可用的名字）
                 # 跳过标记用 ad_ 前缀：不能和「老逻辑整包同步过」的文件夹标记混在一起，
@@ -450,9 +459,10 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
     task_id = task.get("id")
     action = ad_action()
     action_text = ad_action_text()
+    repl = ad_replacements()
     try:
         groups, skipped, ad_names, dirs, truncated = _scan_share_tree(
-            client, meta, task_id, ad_kw, ad_wl, action, action_text
+            client, meta, task_id, ad_kw, ad_wl, action, action_text, repl
         )
     except Exception as e:  # noqa: BLE001
         emit("error", f"[{name_tag}] 读取分享目录失败：{e}")
@@ -464,7 +474,7 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
 
     # 词表变了就把新词应用到目标目录里已有的文件上（用户明确保存过自定义词时，首次也算「变了」）；
     # 只用默认词表且没有历史指纹的老任务首次只记录指纹，不去清理，避免升级后突然删东西
-    sig = adfilter.signature(ad_kw, ad_wl, action, action_text) if ad_kw else ""
+    sig = adfilter.signature(ad_kw, ad_wl, action, action_text, repl) if ad_kw else ""
     sig_key = f"ad_sig_{task_id}"
     stored_sig = db.get_setting(sig_key, "")
     custom_saved = db.get_setting("ad_keywords", None) is not None
@@ -529,7 +539,8 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
                 pairs: list = []
                 n = client.rename_ad_items(
                     _norm_target(target_dir),
-                    lambda nm, isdir: adfilter.ad_target_name(nm, isdir, ad_kw, ad_wl, action, action_text) or None,
+                    lambda nm, isdir: adfilter.ad_target_name(
+                        nm, isdir, ad_kw, ad_wl, action, action_text, repl) or None,
                     renamed=pairs,
                 )
                 if n:

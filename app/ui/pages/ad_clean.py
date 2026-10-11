@@ -126,67 +126,60 @@ class AdCleanPage(QWidget):
         lay = QVBoxLayout(left)
         lay.setContentsMargins(24, 20, 10, 20)
         lay.setSpacing(12)
-        lay.addWidget(PageHeader("广告清理", "扫描文件夹里命中关键词的文件 / 文件夹，勾选后删除"))
+        lay.addWidget(PageHeader("广告清理", "设置自动同步遇到广告怎么处理；也可手动扫描文件夹删除广告"))
 
         body = QWidget()
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(12)
 
-        form = card()
-        fl = QVBoxLayout(form)
-        fl.setContentsMargins(18, 16, 18, 18)
-        fl.setSpacing(14)
-
-        self.account = QComboBox()
-        fl.addWidget(field_group("账号", self.account))
-
-        self.folder_edit = QLineEdit("/")
-        pick = square_button("folder", "浏览网盘选择文件夹")
-        pick.clicked.connect(self.pick_folder)
-        fl.addWidget(field_group("要清理的文件夹", input_with_button(self.folder_edit, pick)))
-
-        self.recursive = QCheckBox("包括子文件夹（递归扫描，最多 1000 个目录）")
-        self.recursive.setChecked(True)
-        fl.addWidget(self.recursive)
-
-        self.kw_input = QPlainTextEdit()
-        self.kw_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
-        self.kw_input.setFixedHeight(110)
-        fl.addWidget(field_group("广告关键词", self.kw_input,
-                                 "一行一个或用逗号分隔，文件名命中即视为广告；与「自动同步」的去广告共用。"))
-
-        self.wl_input = QPlainTextEdit()
-        self.wl_input.setPlainText(db.get_setting("ad_whitelist", ""))
-        self.wl_input.setFixedHeight(72)
-        self.wl_input.setPlaceholderText("如：我的公众号名、你的推广品牌…")
         # 输入停顿 0.6 秒就自动保存：以前必须点「保存」或「扫描」才生效，
         # 填完关键词直接去同步 = 用的还是旧关键词（这就是「自定义广告词没生效」）
         self._kw_timer = QTimer(self)
         self._kw_timer.setSingleShot(True)
         self._kw_timer.setInterval(600)
         self._kw_timer.timeout.connect(self._persist_keywords)
-        self.kw_input.textChanged.connect(self._kw_timer.start)
-        self.wl_input.textChanged.connect(self._kw_timer.start)
-        fl.addWidget(field_group("白名单关键词", self.wl_input,
-                                 "命中白名单的文件绝不清理、也不跳过，用来保护你自己插入的广告。"))
 
-        # 自动同步遇到广告时怎么处理（分享链接任务生效；好友/群任务始终按跳过处理）
+        # ---- 卡片 1（最上面）：自动同步遇到广告怎么处理 + 广告词 ----
+        form = card()
+        fl = QVBoxLayout(form)
+        fl.setContentsMargins(18, 16, 18, 18)
+        fl.setSpacing(14)
+
         self.action = QComboBox()
+        self.action.addItem("改名：按下面的广告词规则改掉广告名字", adfilter.ACTION_REPLACE)
         self.action.addItem("跳过：不转存（网盘里已有的会被删除）", adfilter.ACTION_SKIP)
-        self.action.addItem("替换：把名字里命中的词换成下面的内容", adfilter.ACTION_REPLACE)
-        self.action.addItem("改名：整个名字改成下面的内容（文件保留扩展名）", adfilter.ACTION_RENAME)
         cur = db.get_setting("ad_action", adfilter.ACTION_SKIP)
+        if cur == adfilter.ACTION_RENAME:      # 3.0.5 的「整个改名」并入改名模式
+            cur = adfilter.ACTION_REPLACE
         self.action.setCurrentIndex(max(0, self.action.findData(cur)))
-        self.action_text = QLineEdit(db.get_setting("ad_action_text", ""))
-        self.action_text.setPlaceholderText("替换为空 = 直接删掉命中的词；改名必须填")
         fl.addWidget(field_group("命中广告后（自动同步）", self.action,
-                                 "改成「替换 / 改名」后，下一次同步会把网盘里已有的广告文件/文件夹按新规则改名。"
+                                 "改设置后，下一次同步会把网盘里已有的广告文件/文件夹按新规则处理。"
                                  "仅对分享链接任务生效，好友 / 群任务仍按跳过处理。"))
-        fl.addWidget(self.action_text)
-        self.action.currentIndexChanged.connect(self._on_action_changed)
-        self.action_text.textChanged.connect(self._kw_timer.start)
-        self._on_action_changed(persist=False)
+
+        self.action_text = QLineEdit(db.get_setting("ad_action_text", ""))
+        self.action_text.setPlaceholderText("如：资料（不填 = 只删掉命中的广告词）")
+        self.fallback_group = field_group(
+            "兜底名字", self.action_text,
+            "广告词没写「=替换内容」时，命中后整个名字改成它（文件保留扩展名，重名自动加 (2)）。",
+        )
+        fl.addWidget(self.fallback_group)
+
+        self.kw_input = QPlainTextEdit()
+        self.kw_input.setPlainText(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
+        self.kw_input.setFixedHeight(130)
+        fl.addWidget(field_group(
+            "广告关键词", self.kw_input,
+            "一行一个。写成「广告词=替换内容」只换掉这几个字（如 家瘦猴=资料；「家瘦猴=」表示删掉）；"
+            "只写广告词就走上面的兜底名字。手动扫描清理也用这份词表。",
+        ))
+
+        self.wl_input = QPlainTextEdit()
+        self.wl_input.setPlainText(db.get_setting("ad_whitelist", ""))
+        self.wl_input.setFixedHeight(64)
+        self.wl_input.setPlaceholderText("如：我的公众号名、你的推广品牌…")
+        fl.addWidget(field_group("白名单关键词", self.wl_input,
+                                 "命中白名单的文件绝不处理，用来保护你自己插入的广告。"))
 
         kwrow = QHBoxLayout()
         self.save_state = hint("")
@@ -195,8 +188,34 @@ class AdCleanPage(QWidget):
         save_kw.clicked.connect(self.save_keywords)
         kwrow.addWidget(save_kw)
         fl.addLayout(kwrow)
+
+        self.kw_input.textChanged.connect(self._kw_timer.start)
+        self.wl_input.textChanged.connect(self._kw_timer.start)
+        self.action_text.textChanged.connect(self._kw_timer.start)
+        self.action.currentIndexChanged.connect(self._on_action_changed)
+        self._on_action_changed(persist=False)
         self._show_save_state(saved=db.get_setting("ad_keywords", None) is not None)
         bl.addWidget(form)
+
+        # ---- 卡片 2：手动扫描清理 ----
+        scan_card = card()
+        sl = QVBoxLayout(scan_card)
+        sl.setContentsMargins(18, 16, 18, 18)
+        sl.setSpacing(14)
+        sl.addWidget(label("手动扫描清理", "SectionTitle"))
+
+        self.account = QComboBox()
+        sl.addWidget(field_group("账号", self.account))
+
+        self.folder_edit = QLineEdit("/")
+        pick = square_button("folder", "浏览网盘选择文件夹")
+        pick.clicked.connect(self.pick_folder)
+        sl.addWidget(field_group("要清理的文件夹", input_with_button(self.folder_edit, pick)))
+
+        self.recursive = QCheckBox("包括子文件夹（递归扫描，最多 1000 个目录）")
+        self.recursive.setChecked(True)
+        sl.addWidget(self.recursive)
+        bl.addWidget(scan_card)
         bl.addStretch()
         lay.addWidget(scroll_wrap(body), 1)
 
@@ -302,7 +321,7 @@ class AdCleanPage(QWidget):
         self._show_save_state(saved=True)
 
     def _on_action_changed(self, *_a, persist: bool = True):
-        self.action_text.setEnabled(self.action.currentData() != adfilter.ACTION_SKIP)
+        self.fallback_group.setVisible(self.action.currentData() != adfilter.ACTION_SKIP)
         if persist:
             self._kw_timer.start()
 

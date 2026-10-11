@@ -16,9 +16,33 @@ import unicodedata
 _CONFUSABLE = str.maketrans({"I": "l", "1": "l", "|": "l", "ǀ": "l", "ｌ": "l", "Ｉ": "l"})
 
 
+def parse_keyword_rules(raw: str) -> list[tuple[str, str | None]]:
+    """一行一个或用逗号分隔；每项可写成 `广告词=替换成的内容`（全角＝也行）。
+
+    返回 [(广告词, 替换内容 或 None)]。None = 没设置替换内容（命中后走兜底：整个名字改掉）。
+    `广告词=`（等号后留空）表示替换成空，即直接删掉这几个字。
+    """
+    out = []
+    for item in re.split(r"[\n,，]", raw or ""):
+        item = item.strip()
+        if not item:
+            continue
+        m = re.match(r"^(.*?)[=＝](.*)$", item)
+        if m and m.group(1).strip():
+            out.append((m.group(1).strip(), m.group(2).strip()))
+        else:
+            out.append((item, None))
+    return out
+
+
 def parse_keywords(raw: str) -> list[str]:
-    """一行一个或用逗号分隔。"""
-    return [k.strip() for k in re.split(r"[\n,，]", raw or "") if k.strip()]
+    """只取广告词本身（`广告词=替换内容` 只要等号左边）。"""
+    return [k for k, _ in parse_keyword_rules(raw)]
+
+
+def parse_replacements(raw: str) -> dict[str, str]:
+    """{广告词: 替换内容}，只含写了 `=` 的项。"""
+    return {k: r for k, r in parse_keyword_rules(raw) if r is not None}
 
 
 def _strip_invisible(text: str) -> str:
@@ -55,7 +79,7 @@ def contains_any(name: str, keywords: list[str]) -> bool:
 
 
 def signature(ad_kw: list[str], whitelist: list[str] | None = None,
-              action: str = "skip", text: str = "") -> str:
+              action: str = "skip", text: str = "", replacements: dict | None = None) -> str:
     """关键词 + 白名单 + 处理方式的指纹：任一变了就变，用来判断「该把新设置应用到已有文件上」。"""
     import hashlib
 
@@ -63,13 +87,14 @@ def signature(ad_kw: list[str], whitelist: list[str] | None = None,
         "\n".join(sorted({normalize(k) for k in (whitelist or []) if k}))
     if action != "skip":                      # 兼容：跳过模式的指纹和以前一样，升级后不会误触发
         body += f"\n||{action}||{text}"
+        body += "\n||" + "\n".join(f"{normalize(k)}={v}" for k, v in sorted((replacements or {}).items()))
     return hashlib.sha1(body.encode("utf-8")).hexdigest()
 
 
 # ---- 命中广告后的处理方式 ----
 ACTION_SKIP = "skip"          # 不转存（已在网盘里的会被删除）
-ACTION_REPLACE = "replace"    # 把名字里命中的词替换成指定内容
-ACTION_RENAME = "rename"      # 整个名字改成指定内容（文件保留扩展名）
+ACTION_REPLACE = "replace"    # 改名：设置了替换内容的词只换这几个字，没设置的整个名字改成兜底名字
+ACTION_RENAME = "rename"      # 旧值（3.0.5 的「整个改名」），现在与 replace 同义
 ACTIONS = (ACTION_SKIP, ACTION_REPLACE, ACTION_RENAME)
 
 _ZW = "[\\s​‌‍⁠﻿]*"         # 关键词字符之间允许的空白 / 零宽字符
@@ -101,36 +126,52 @@ def _clean_name(name: str) -> str:
     return name
 
 
-def replace_keywords(name: str, keywords: list[str], repl: str) -> str:
-    """把名字里命中的关键词（宽松匹配）替换成 repl；长的关键词先替换，避免被短词截断。"""
-    out = name
-    for k in sorted({k for k in keywords if k}, key=len, reverse=True):
+def _whole_rename(name: str, isdir: bool, text: str) -> str:
+    """整个名字改成 text；文件保留原扩展名。"""
+    new = _clean_name(text or "")
+    if new and not isdir:
+        stem, dot, ext = name.rpartition(".")
+        if dot and stem and 0 < len(ext) <= 8 and " " not in ext and not new.lower().endswith("." + ext.lower()):
+            new = f"{new}.{ext}"
+    return new
+
+
+def _partial_replace(name: str, isdir: bool, pairs: list[tuple[str, str]]) -> str:
+    """只把命中的词换成各自的替换内容；结果只剩扩展名或空 → 返回 ""。"""
+    raw = name
+    for k, r in sorted(pairs, key=lambda p: len(p[0]), reverse=True):   # 长词先换
         rx = _keyword_regex(k)
         if rx is not None:
-            out = rx.sub(lambda _m: repl, out)
-    return out
+            raw = rx.sub(lambda _m, r=r: r, raw)
+    stem, dot, _ext = raw.strip().rpartition(".")
+    if not isdir and dot and not stem.strip():
+        return ""
+    return _clean_name(raw)
 
 
 def ad_target_name(name: str, isdir: bool, ad_kw: list[str], whitelist: list[str] | None,
-                   action: str, text: str):
-    """命中广告时该怎么处理：返回 None = 不是广告；"" = 跳过；其它 = 改成这个名字。"""
+                   action: str, text: str, replacements: dict | None = None):
+    """命中广告时该怎么处理：返回 None = 不是广告；"" = 跳过；其它 = 改成这个名字。
+
+    改名模式（replace / 旧的 rename）：
+      - 命中的词**都**设置了替换内容（`广告词=内容`）→ 只把这几个字换掉；
+      - 有命中的词**没**设置替换内容 → 兜底：整个名字改成 text（文件保留扩展名）；
+        text 也没填 → 把命中的词直接删掉。
+      - 改完名字为空（或只剩扩展名）→ 跳过。
+    """
     if not ad_kw or not is_ad_to_remove(name, ad_kw, whitelist):
         return None
-    if action == ACTION_REPLACE:
-        raw = replace_keywords(name, ad_kw, text or "")
-        stem, dot, _ext = raw.strip().rpartition(".")
-        if not isdir and dot and not stem.strip():     # 只剩下 ".jpg" 这种 → 没有可用的名字
-            return ""
-        new = _clean_name(raw)
-    elif action == ACTION_RENAME:
-        new = _clean_name(text or "")
-        if new and not isdir:
-            _stem, dot, ext = name.rpartition(".")
-            if dot and _stem and 0 < len(ext) <= 8 and " " not in ext and not new.lower().endswith("." + ext.lower()):
-                new = f"{new}.{ext}"
-    else:
+    if action not in (ACTION_REPLACE, ACTION_RENAME):
         return ""
-    return new or ""                                    # 替换完是空的 → 只能跳过
+    replacements = replacements or {}
+    hits = [k for k in ad_kw if k and contains_any(name, [k])]
+    if hits and all(k in replacements for k in hits):
+        new = _partial_replace(name, isdir, [(k, replacements[k]) for k in hits])
+    elif (text or "").strip():
+        new = _whole_rename(name, isdir, text)
+    else:
+        new = _partial_replace(name, isdir, [(k, replacements.get(k, "")) for k in hits])
+    return new or ""
 
 
 def is_ad_to_remove(name: str, ad_kw: list[str], whitelist: list[str] | None = None) -> bool:

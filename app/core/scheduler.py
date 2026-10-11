@@ -74,6 +74,8 @@ class Scheduler(QThread):
 
     def _log_done(self, task: dict, result: dict):
         """定时同步有实际变化或出错时记一条完成提示（带下次同步时间）；无变化不刷屏。"""
+        if result.get("busy"):
+            return   # 恰好被「立即同步」抢先在跑：不是失败，不记错误
         if not result.get("transferred") and not result.get("error"):
             return
         name = task.get("note") or task.get("entity_name") or task.get("link") or "任务"

@@ -16,6 +16,7 @@ from typing import Callable, Optional
 
 from app.netdisk import get_client_for_account
 from app.core.rename import apply_rules
+from app.core import adfilter
 from app import db
 from app.config import DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY
 
@@ -142,26 +143,24 @@ def next_run_ts(task: dict) -> int:
 
 # ---- 广告过滤 ----
 def ad_keywords() -> list[str]:
-    raw = db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS)
-    return [k.strip() for k in re.split(r"[\n,，]", raw) if k.strip()]
+    return adfilter.parse_keywords(db.get_setting("ad_keywords", DEFAULT_AD_KEYWORDS))
 
 
 def ad_whitelist() -> list[str]:
     """白名单关键词：文件名命中则永不清理/跳过（保护自己插入的广告等）。"""
-    raw = db.get_setting("ad_whitelist", "")
-    return [k.strip() for k in re.split(r"[\n,，]", raw) if k.strip()]
+    return adfilter.parse_keywords(db.get_setting("ad_whitelist", ""))
 
 
-def _is_ad(name: str, keywords: list[str]) -> bool:
-    low = (name or "").lower()
-    return any(k.lower() in low for k in keywords)
+# 匹配规则（全角/半角、空白、I/l/1 混写）统一在 adfilter，这里只做别名保持旧调用不变
+is_ad_to_remove = adfilter.is_ad_to_remove
 
 
-def is_ad_to_remove(name: str, ad_kw: list[str], whitelist: list[str]) -> bool:
-    """是否应作为广告清理/跳过：命中广告词、且未命中白名单。"""
-    if whitelist and _is_ad(name, whitelist):
-        return False
-    return _is_ad(name, ad_kw)
+def _log_ad_skipped(emit, name_tag: str, names: list[str]) -> None:
+    """把被广告词跳过的名字记进运行记录，用户能看见「到底按哪个词、跳过了谁」。"""
+    if not names:
+        return
+    shown = "、".join(names[:8]) + (f" 等 {len(names)} 项" if len(names) > 8 else "")
+    emit("skip", f"[{name_tag}] 命中广告词，已跳过：{shown}")
 
 
 def _folder_ref(link) -> Optional[dict]:
@@ -218,7 +217,8 @@ def run_task(task: dict, log: Optional[LogFn] = None) -> dict:
     """
     tid = task.get("id")
     if not _try_mark_running(tid):
-        return _result(error="任务正在运行中，本次跳过")
+        # busy=True：不是真正的失败，界面不要弹错误框。运行标记归「正在跑的那一次」管，这里绝不能去清
+        return {**_result(error="任务正在运行中，本次跳过"), "busy": True}
     try:
         with _GLOBAL_RUN_LOCK:
             kind = task.get("kind", "share")
@@ -283,6 +283,7 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
     # 去重 + 去广告
     new_items = []
     skipped = 0
+    ad_names = []
     for f in files:
         fs_key = client.share_key(meta, f)
         if db.is_transferred(task_id, fs_key):
@@ -291,8 +292,10 @@ def _run_share_task(task: dict, log: Optional[LogFn] = None) -> dict:
         if ad_kw and is_ad_to_remove(f["server_filename"], ad_kw, ad_wl):
             db.mark_transferred(task_id, fs_key, f["server_filename"])  # 记下不再处理
             skipped += 1
+            ad_names.append(f["server_filename"])
             continue
         new_items.append(f)
+    _log_ad_skipped(emit, name_tag, ad_names)
 
     if not new_items:
         _quiet_done(emit, name_tag, skipped)
@@ -398,6 +401,7 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
 
     # 先做去重/去广告筛选，没有新东西就不碰网盘（不建目录、不建中转目录）
     skipped = 0
+    ad_names = []
     pending = []  # [(msg, new_files)]
     for msg in messages:
         new_files = []
@@ -409,10 +413,12 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
             if ad_kw and is_ad_to_remove(f["server_filename"], ad_kw, ad_wl):
                 db.mark_transferred(task_id, fs_key, f["server_filename"])
                 skipped += 1
+                ad_names.append(f["server_filename"])
                 continue
             new_files.append(f)
         if new_files:
             pending.append((msg, new_files))
+    _log_ad_skipped(emit, name_tag, ad_names)
 
     if not pending:
         _quiet_done(emit, name_tag, skipped)

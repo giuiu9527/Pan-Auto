@@ -536,6 +536,10 @@ class FriendMessagePage(QWidget):
         self.reload_sync_tasks()
 
     def _on_sync_done(self, result: dict):
+        if result.get("busy"):
+            self.msg_status.setText("该任务正在同步中（可能是定时任务刚好在跑），请稍候。")
+            self.reload_sync_tasks()
+            return
         self.msg_status.setText(
             f"同步完成：新增 {result.get('transferred', 0)}，"
             f"跳过 {result.get('skipped', 0)}，改名 {result.get('renamed', 0)}"

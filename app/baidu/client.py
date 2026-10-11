@@ -252,9 +252,10 @@ class BaiduPanClient:
         """
         if not ad_kw:
             return 0
-        whitelist = whitelist or []
-        keywords = [k.lower() for k in ad_kw if k]
-        protected = [k.lower() for k in whitelist if k]
+        from app.core.adfilter import contains_any
+
+        keywords = [k for k in ad_kw if k]
+        protected = [k for k in (whitelist or []) if k]
         pending = [root]
         matches = []
         calls = 0
@@ -267,14 +268,13 @@ class BaiduPanClient:
                 continue
             for item in items:
                 name = item.get("server_filename") or ""
-                low = name.lower()
-                if any(w in low for w in protected):
+                if contains_any(name, protected):
                     # 白名单文件夹及其全部内容均保留。
                     continue
                 path = item.get("path")
                 if not path:
                     continue
-                if any(k in low for k in keywords):
+                if contains_any(name, keywords):
                     matches.append(path)
                 elif item.get("isdir"):
                     pending.append(path)

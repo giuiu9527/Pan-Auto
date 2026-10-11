@@ -63,8 +63,10 @@ def ad_scan(args: dict) -> Any:
     duplicating the ~15 lines here (instead of importing a QThread meant to
     run inside a QApplication event loop) is fine."""
     client = _client(args["account_id"])
-    keywords = [k.lower() for k in args.get("keywords", [])]
-    whitelist = [w.lower() for w in args.get("whitelist", [])]
+    from app.core.adfilter import contains_any
+
+    keywords = list(args.get("keywords", []))
+    whitelist = list(args.get("whitelist", []))
     recursive = args.get("recursive", True)
     matched: list[dict] = []
     q = deque([args.get("folder") or "/"])
@@ -74,10 +76,9 @@ def ad_scan(args: dict) -> Any:
         scanned += 1
         for it in client.list_dir(cur):
             name = it.get("server_filename", "")
-            low = name.lower()
-            if any(w in low for w in whitelist):
+            if contains_any(name, whitelist):
                 continue
-            if any(k in low for k in keywords):
+            if contains_any(name, keywords):
                 matched.append({
                     "name": name,
                     "path": it.get("path", ""),

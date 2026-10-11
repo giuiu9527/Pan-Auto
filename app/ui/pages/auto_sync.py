@@ -16,12 +16,12 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QMenu,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QEvent
+from PySide6.QtCore import Qt, QThread, Signal, QEvent, QTimer
 
 from app import db
 from app import theme
 from app.core.transfer import (
-    run_task, next_run_ts, running_task_ids, set_task_running, is_task_running,
+    run_task, next_run_ts, running_task_ids, is_task_running,
     INTERVAL_CHOICES, INTERVAL_SECONDS, interval_label,
 )
 from app.netdisk import account_display_name
@@ -555,16 +555,23 @@ class AutoSyncPage(QWidget):
         if is_task_running(task.get("id")):
             QMessageBox.information(self, "正在运行", "该任务正在同步中，请稍候。")
             return
-        set_task_running(task.get("id"), True)
+        # ★这里不能自己去标记「运行中」：标记由 run_task 在工作线程里原子地打、finally 里清。
+        #   以前这里先 set_task_running(True)，run_task 一看「已经在跑」就直接返回、也不会清标记，
+        #   结果任务永远显示「运行中」，调度器也因此再也不跑它（直到重启程序）。
         worker = TransferWorker(task)
         worker.finished_task.connect(self._on_transfer_done)
         worker.finished.connect(lambda w=worker: self._workers.remove(w) if w in self._workers else None)
         self._workers.append(worker)
         worker.start()
-        self.reload_tasks()
+        # 等工作线程打上运行标记后再刷新，列表才会显示「运行中」
+        QTimer.singleShot(300, self.reload_tasks)
         self.header.set_subtitle("同步已在后台执行，完成后会弹窗提示，进度见「运行记录」")
 
     def _on_transfer_done(self, result: dict):
+        if result.get("busy"):
+            # 恰好调度器在跑同一个任务：不算错误，不弹框，等那一次跑完自然刷新
+            self.reload_tasks()
+            return
         msg = f"新增 {result['transferred']}，跳过 {result['skipped']}，改名 {result['renamed']}"
         if result.get("error"):
             QMessageBox.warning(self, "同步完成（含错误）", msg + f"\n错误：{result['error']}")

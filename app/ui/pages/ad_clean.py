@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QStackedWidget,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
 from app import db
 from app import theme
 from app.core.transfer import DEFAULT_AD_KEYWORDS
+from app.core.adfilter import contains_any, parse_keywords
 from app.netdisk import get_client_for_account, account_display_name
 from app.quark.client import display_path
 from app.ui.icons import make_icon
@@ -36,7 +37,7 @@ from app.ui.widgets import (
 
 
 def _parse_keywords(raw: str) -> list[str]:
-    return [k.strip() for k in re.split(r"[\n,，]", raw or "") if k.strip()]
+    return parse_keywords(raw)
 
 
 class ScanWorker(QThread):
@@ -48,8 +49,8 @@ class ScanWorker(QThread):
         super().__init__()
         self.account_id = account_id
         self.folder = folder
-        self.keywords = [k.lower() for k in keywords]
-        self.whitelist = [w.lower() for w in (whitelist or [])]
+        self.keywords = list(keywords)
+        self.whitelist = list(whitelist or [])
         self.recursive = recursive
 
     def run(self):
@@ -67,10 +68,9 @@ class ScanWorker(QThread):
                 self.progress.emit(f"扫描中… 已查 {scanned} 个目录，命中 {len(matched)}")
                 for it in client.list_dir(cur):
                     name = it.get("server_filename", "")
-                    low = name.lower()
-                    if any(w in low for w in self.whitelist):
+                    if contains_any(name, self.whitelist):
                         continue
-                    if any(k in low for k in self.keywords):
+                    if contains_any(name, self.keywords):
                         matched.append({
                             "name": name, "path": it.get("path", ""), "size": it.get("size", 0),
                             "dir": cur, "isdir": bool(it.get("isdir")),
@@ -159,6 +159,14 @@ class AdCleanPage(QWidget):
         self.wl_input.setPlainText(db.get_setting("ad_whitelist", ""))
         self.wl_input.setFixedHeight(72)
         self.wl_input.setPlaceholderText("如：我的公众号名、你的推广品牌…")
+        # 输入停顿 0.6 秒就自动保存：以前必须点「保存」或「扫描」才生效，
+        # 填完关键词直接去同步 = 用的还是旧关键词（这就是「自定义广告词没生效」）
+        self._kw_timer = QTimer(self)
+        self._kw_timer.setSingleShot(True)
+        self._kw_timer.setInterval(600)
+        self._kw_timer.timeout.connect(self._persist_keywords)
+        self.kw_input.textChanged.connect(self._kw_timer.start)
+        self.wl_input.textChanged.connect(self._kw_timer.start)
         fl.addWidget(field_group("白名单关键词", self.wl_input,
                                  "命中白名单的文件绝不清理、也不跳过，用来保护你自己插入的广告。"))
 
@@ -266,9 +274,19 @@ class AdCleanPage(QWidget):
             self.account.setCurrentIndex(idx)
         self.account.blockSignals(False)
 
-    def save_keywords(self):
+    def _persist_keywords(self):
         db.set_setting("ad_keywords", self.kw_input.toPlainText().strip())
         db.set_setting("ad_whitelist", self.wl_input.toPlainText().strip())
+
+    def hideEvent(self, e):
+        # 切走页面时把还没来得及自动保存的内容落盘
+        if self._kw_timer.isActive():
+            self._kw_timer.stop()
+            self._persist_keywords()
+        super().hideEvent(e)
+
+    def save_keywords(self):
+        self._persist_keywords()
         QMessageBox.information(self, "已保存", "广告关键词与白名单已更新，自动同步的去广告也会使用。")
 
     # ---- 目录选择 ----

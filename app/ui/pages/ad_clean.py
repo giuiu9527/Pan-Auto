@@ -24,6 +24,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from app import db
 from app import theme
 from app.core.transfer import DEFAULT_AD_KEYWORDS
+from app.core import adfilter
 from app.core.adfilter import contains_any, parse_keywords
 from app.netdisk import get_client_for_account, account_display_name
 from app.quark.client import display_path
@@ -32,7 +33,7 @@ from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.widgets import (
     card, field_group, button, square_button, icon_button, input_with_button,
     PageHeader, TwoColumn, scroll_wrap, setup_table, table_frame, fmt_size,
-    EmptyState, label,
+    EmptyState, label, hint,
 )
 
 
@@ -170,12 +171,31 @@ class AdCleanPage(QWidget):
         fl.addWidget(field_group("白名单关键词", self.wl_input,
                                  "命中白名单的文件绝不清理、也不跳过，用来保护你自己插入的广告。"))
 
+        # 自动同步遇到广告时怎么处理（分享链接任务生效；好友/群任务始终按跳过处理）
+        self.action = QComboBox()
+        self.action.addItem("跳过：不转存（网盘里已有的会被删除）", adfilter.ACTION_SKIP)
+        self.action.addItem("替换：把名字里命中的词换成下面的内容", adfilter.ACTION_REPLACE)
+        self.action.addItem("改名：整个名字改成下面的内容（文件保留扩展名）", adfilter.ACTION_RENAME)
+        cur = db.get_setting("ad_action", adfilter.ACTION_SKIP)
+        self.action.setCurrentIndex(max(0, self.action.findData(cur)))
+        self.action_text = QLineEdit(db.get_setting("ad_action_text", ""))
+        self.action_text.setPlaceholderText("替换为空 = 直接删掉命中的词；改名必须填")
+        fl.addWidget(field_group("命中广告后（自动同步）", self.action,
+                                 "改成「替换 / 改名」后，下一次同步会把网盘里已有的广告文件/文件夹按新规则改名。"
+                                 "仅对分享链接任务生效，好友 / 群任务仍按跳过处理。"))
+        fl.addWidget(self.action_text)
+        self.action.currentIndexChanged.connect(self._on_action_changed)
+        self.action_text.textChanged.connect(self._kw_timer.start)
+        self._on_action_changed(persist=False)
+
         kwrow = QHBoxLayout()
-        kwrow.addStretch()
-        save_kw = button("保存关键词 / 白名单", "Ghost", "check")
+        self.save_state = hint("")
+        kwrow.addWidget(self.save_state, 1)
+        save_kw = button("保存", "Ghost", "check")
         save_kw.clicked.connect(self.save_keywords)
         kwrow.addWidget(save_kw)
         fl.addLayout(kwrow)
+        self._show_save_state(saved=db.get_setting("ad_keywords", None) is not None)
         bl.addWidget(form)
         bl.addStretch()
         lay.addWidget(scroll_wrap(body), 1)
@@ -277,6 +297,21 @@ class AdCleanPage(QWidget):
     def _persist_keywords(self):
         db.set_setting("ad_keywords", self.kw_input.toPlainText().strip())
         db.set_setting("ad_whitelist", self.wl_input.toPlainText().strip())
+        db.set_setting("ad_action", self.action.currentData())
+        db.set_setting("ad_action_text", self.action_text.text().strip())
+        self._show_save_state(saved=True)
+
+    def _on_action_changed(self, *_a, persist: bool = True):
+        self.action_text.setEnabled(self.action.currentData() != adfilter.ACTION_SKIP)
+        if persist:
+            self._kw_timer.start()
+
+    def _show_save_state(self, saved: bool):
+        n = len(parse_keywords(self.kw_input.toPlainText()))
+        if saved:
+            self.save_state.setText(f"已自动保存：{n} 个关键词，自动同步立即按此生效")
+        else:
+            self.save_state.setText("当前显示的是默认词表（还没保存过）。改动任意内容会自动保存")
 
     def hideEvent(self, e):
         # 切走页面时把还没来得及自动保存的内容落盘

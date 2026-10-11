@@ -293,6 +293,52 @@ class BaiduPanClient:
                     removed.extend(n for _, n in batch)
         return deleted
 
+    def rename_and_wait(self, path: str, newname: str) -> bool:
+        """改名并等异步任务完成；成功返回 True。"""
+        d = self.rename(path, newname)
+        if d.get("errno") not in (0, None):
+            return False
+        if d.get("taskid"):
+            return self.wait_task(d["taskid"]).get("status") == "success"
+        return True
+
+    def rename_ad_items(self, root: str, namer, renamed: list | None = None,
+                        max_calls: int = 400) -> int:
+        """递归把 ``root`` 里命中广告词的文件/文件夹**改名**（广告处理方式为「替换/改名」时用）。
+
+        ``namer(name, isdir)`` 返回新名字；返回 None / "" / 原名表示不改。
+        同目录已有同名项时不改（避免覆盖或生成副本）。改名后的文件夹会继续往里查。
+        """
+        pending = [root]
+        calls = 0
+        count = 0
+        while pending and calls < max_calls:
+            cur = pending.pop()
+            calls += 1
+            try:
+                items = self.list_dir(cur)
+            except Exception:  # noqa: BLE001
+                continue
+            names = {i.get("server_filename") for i in items}
+            for it in items:
+                name = it.get("server_filename") or ""
+                path = it.get("path")
+                if not path:
+                    continue
+                isdir = bool(it.get("isdir"))
+                new = namer(name, isdir)
+                if new and new != name and new not in names and self.rename_and_wait(path, new):
+                    count += 1
+                    names.add(new)
+                    if renamed is not None:
+                        renamed.append((name, new))
+                    if isdir:
+                        pending.append(_join_path(cur, new))
+                    continue
+                if isdir:
+                    pending.append(path)
+        return count
+
     def wait_task(self, taskid, timeout: float = 120.0) -> dict:
         """轮询 filemanager 异步任务直到完成，返回最终状态。"""
         deadline = time.time() + timeout

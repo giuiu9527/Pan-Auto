@@ -23,6 +23,7 @@ from app import theme
 from app.core.transfer import (
     run_task, next_run_ts, running_task_ids, is_task_running,
     INTERVAL_CHOICES, INTERVAL_SECONDS, interval_label,
+    ad_keywords, ad_action, ad_action_text,
 )
 from app.netdisk import account_display_name
 from app.ui.icons import make_icon
@@ -62,6 +63,7 @@ class TransferWorker(QThread):
 
 class AutoSyncPage(QWidget):
     tasks_changed = Signal()
+    open_ad_settings = Signal()   # 「设置广告词」→ 主窗口切到广告清理页
 
     def __init__(self):
         super().__init__()
@@ -145,9 +147,19 @@ class AutoSyncPage(QWidget):
 
         self.rename_on = QCheckBox("同步后按「批量重命名」里的规则自动改名")
         fl.addWidget(self.rename_on)
-        self.ad_skip = QCheckBox("自动过滤广告文件（关键词在「广告清理」页配置）")
+        self.ad_skip = QCheckBox("自动处理广告文件")
         self.ad_skip.setChecked(True)
         fl.addWidget(self.ad_skip)
+        # 直接显示「现在到底按什么生效」：以前关键词在另一页、存没存上看不出来，结果一直用默认词表
+        ad_row = QHBoxLayout()
+        ad_row.setContentsMargins(24, 0, 0, 0)
+        self.ad_status = hint("")
+        ad_row.addWidget(self.ad_status, 1)
+        ad_link = button("设置广告词", "Link")
+        ad_link.clicked.connect(self.open_ad_settings.emit)
+        ad_row.addWidget(ad_link, 0, Qt.AlignTop)
+        fl.addLayout(ad_row)
+        self._refresh_ad_status()
 
         self.note = QLineEdit()
         self.note.setPlaceholderText("便于识别，如：BL 讲义更新")
@@ -287,6 +299,18 @@ class AutoSyncPage(QWidget):
     def on_shown(self):
         self.refresh_accounts()
         self.reload_tasks()
+        self._refresh_ad_status()
+
+    def _refresh_ad_status(self):
+        kws = ad_keywords()
+        custom = db.get_setting("ad_keywords", None) is not None
+        action, text = ad_action(), ad_action_text()
+        how = {"skip": "跳过不转存",
+               "replace": f"把命中的词替换为「{text}」" if text else "删掉命中的词",
+               "rename": f"整个名字改为「{text}」" if text else "改名（未填新名字，按跳过处理）"}[action]
+        src = f"{len(kws)} 个自定义广告词" if custom else f"默认词表 {len(kws)} 个词（还没设置自己的广告词）"
+        self.ad_status.setText(f"当前：{src}；命中后{how}")
+        self.ad_status.setStyleSheet("" if custom else f"color:{theme.WARNING};")
 
     def refresh_accounts(self):
         prev = self.account.currentData()

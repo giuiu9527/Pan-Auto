@@ -151,6 +151,16 @@ def ad_whitelist() -> list[str]:
     return adfilter.parse_keywords(db.get_setting("ad_whitelist", ""))
 
 
+def ad_action() -> str:
+    """命中广告后的处理方式：skip（跳过/删除）/ replace（替换命中的词）/ rename（整个名字改掉）。"""
+    a = db.get_setting("ad_action", adfilter.ACTION_SKIP)
+    return a if a in adfilter.ACTIONS else adfilter.ACTION_SKIP
+
+
+def ad_action_text() -> str:
+    return db.get_setting("ad_action_text", "")
+
+
 # 匹配规则（全角/半角、空白、I/l/1 混写）统一在 adfilter，这里只做别名保持旧调用不变
 is_ad_to_remove = adfilter.is_ad_to_remove
 
@@ -343,11 +353,15 @@ def _mirror_dir(target_dir: str, rel: tuple) -> str:
     return base + "/" + "/".join(rel) if rel else (base or "/")
 
 
-def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl):
+def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl,
+                     action: str = adfilter.ACTION_SKIP, action_text: str = ""):
     """递归枚举分享里的所有文件，返回 (groups, skipped, ad_names, dirs, truncated)。
 
-    groups = {相对目录元组: [新文件项]}，只含「没同步过、不是广告」的文件；
-    命中广告词的文件/文件夹整棵不进入（也不会被转存、不会在目标里建目录）。
+    groups = {相对目录元组: [新文件项]}，只含「没同步过」的文件；
+    命中广告词时按处理方式：
+      - 跳过：文件/文件夹整棵不进入（不转存、不在目标里建目录）；
+      - 替换 / 改名：文件夹在目标里直接以**新名字**建出来（内容照常同步），
+        文件照常转存，项里带 ``_final_name``，转存后改成新名字。
 
     ★兼容老任务：老逻辑把分享根下的顶层文件夹整个转存并按「文件夹自己的 fs_id」记已同步。
     遇到「自己已被记为已同步」的文件夹，说明它当时是整包进来的，里面现存的文件都按「已同步」
@@ -390,18 +404,25 @@ def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl):
         for f in items:
             name = f["server_filename"]
             key = client.share_key(meta, f)
-            if ad_kw and is_ad_to_remove(name, ad_kw, ad_wl):
-                if not db.is_transferred(task_id, key):
-                    db.mark_transferred(task_id, key, name)   # 只记一次，之后不再重复提示
+            isdir = bool(int(f.get("isdir") or 0))
+            final = adfilter.ad_target_name(name, isdir, ad_kw, ad_wl, action, action_text) \
+                if ad_kw else None
+            if final == "":                          # 跳过（或替换后没有可用的名字）
+                # 跳过标记用 ad_ 前缀：不能和「老逻辑整包同步过」的文件夹标记混在一起，
+                # 否则改成「替换/改名」后这个文件夹会被当成老数据、里面的东西永远不同步
+                if not db.is_transferred(task_id, "ad_" + key):
+                    db.mark_transferred(task_id, "ad_" + key, name)   # 只记一次，之后不再重复提示
                     ad_names.append(name)
                 skipped += 1
                 continue
-            if int(f.get("isdir") or 0):
+            if isdir:
                 legacy = db.is_transferred(task_id, key) and not db.is_transferred(task_id, "deep_" + key)
                 if legacy:
                     migrated.append(("deep_" + key, name))
-                subdirs.append((f.get("path") or "", rel + (name,), baseline or legacy))
+                subdirs.append((f.get("path") or "", rel + (final or name,), baseline or legacy))
                 continue
+            if final:
+                f = {**f, "_final_name": final}
             if db.is_transferred(task_id, key):
                 skipped += 1
                 continue
@@ -427,9 +448,11 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
     在目标目录里镜像出同样的文件夹（目录已存在不会另建副本，同名文件跳过不会生成副本）。
     """
     task_id = task.get("id")
+    action = ad_action()
+    action_text = ad_action_text()
     try:
         groups, skipped, ad_names, dirs, truncated = _scan_share_tree(
-            client, meta, task_id, ad_kw, ad_wl
+            client, meta, task_id, ad_kw, ad_wl, action, action_text
         )
     except Exception as e:  # noqa: BLE001
         emit("error", f"[{name_tag}] 读取分享目录失败：{e}")
@@ -441,7 +464,7 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
 
     # 词表变了就把新词应用到目标目录里已有的文件上（用户明确保存过自定义词时，首次也算「变了」）；
     # 只用默认词表且没有历史指纹的老任务首次只记录指纹，不去清理，避免升级后突然删东西
-    sig = adfilter.signature(ad_kw, ad_wl) if ad_kw else ""
+    sig = adfilter.signature(ad_kw, ad_wl, action, action_text) if ad_kw else ""
     sig_key = f"ad_sig_{task_id}"
     stored_sig = db.get_setting(sig_key, "")
     custom_saved = db.get_setting("ad_keywords", None) is not None
@@ -462,36 +485,59 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
             errors.append(str(e))
             emit("error", f"[{name_tag}] 处理目录 {dest} 失败：{e}")
             continue
+        # 先定每个文件最终叫什么：普通文件先占名，广告改名的再避让，绝不去改普通文件的名字
+        taken = set(existing)
         fresh = []
-        for f in flist:
-            if f["server_filename"] in existing:     # 目标里已有同名文件：记为已同步，不重复转存
-                db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
+        plain = [f for f in flist if not f.get("_final_name")]
+        ad_renamed = [f for f in flist if f.get("_final_name")]
+        for f in plain + ad_renamed:
+            orig = f["server_filename"]
+            final = f.get("_final_name") or orig
+            if rules:
+                final = apply_rules(final, rules) or final
+            if orig in existing or final in existing:   # 目标里已有：记为已同步，不重复转存
+                db.mark_transferred(task_id, client.share_key(meta, f), orig)
                 skipped += 1
-            else:
-                fresh.append(f)
+                continue
+            if final != orig:
+                final = _unique_name(final, taken)
+            taken.update((orig, final))
+            fresh.append((f, final))
         for batch in _chunks(fresh, 100):
-            res = client.save_files(meta, batch, dest)
+            res = client.save_files(meta, [f for f, _ in batch], dest)
             if res.get("error"):
                 errors.append(res["error"])
                 emit("error", f"[{name_tag}] {dest}：{res['error']}")
                 continue
-            for f in batch:
+            for f, final in batch:
                 db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
                 transferred += 1
-                renamed += _maybe_rename(client, dest, f, rules, name_tag, emit)
+                renamed += _rename_landed(client, dest, f["server_filename"], final,
+                                          bool(f.get("_final_name")), name_tag, emit)
             time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
 
-    # 目标目录里已有的广告：有新转存、或广告词表刚改过时清一遍
-    if ad_kw and (transferred or sig_changed) and hasattr(client, "purge_ad_items"):
+    # 目标目录里已有的广告：有新转存、或广告设置刚改过时处理一遍（跳过模式=删除，替换/改名模式=改名）
+    if ad_kw and (transferred or sig_changed):
         try:
-            removed_names: list[str] = []
-            n = client.purge_ad_items(_norm_target(target_dir), ad_kw, ad_wl, removed=removed_names)
-            if n:
-                shown = "、".join(removed_names[:8]) + (f" 等 {n} 项" if n > 8 else "")
-                emit("info", f"[{name_tag}] 已清理 {n} 个广告文件/文件夹：{shown}")
+            if action == adfilter.ACTION_SKIP and hasattr(client, "purge_ad_items"):
+                removed_names: list[str] = []
+                n = client.purge_ad_items(_norm_target(target_dir), ad_kw, ad_wl, removed=removed_names)
+                if n:
+                    shown = "、".join(removed_names[:8]) + (f" 等 {n} 项" if n > 8 else "")
+                    emit("info", f"[{name_tag}] 已清理 {n} 个广告文件/文件夹：{shown}")
+            elif action != adfilter.ACTION_SKIP and hasattr(client, "rename_ad_items"):
+                pairs: list = []
+                n = client.rename_ad_items(
+                    _norm_target(target_dir),
+                    lambda nm, isdir: adfilter.ad_target_name(nm, isdir, ad_kw, ad_wl, action, action_text) or None,
+                    renamed=pairs,
+                )
+                if n:
+                    shown = "、".join(f"{a} → {b}" for a, b in pairs[:6]) + (f" 等 {n} 项" if n > 6 else "")
+                    emit("info", f"[{name_tag}] 已把 {n} 个广告文件/文件夹改名：{shown}")
         except Exception as e:  # noqa: BLE001
-            errors.append(f"广告清理失败：{e}")
-            emit("error", f"[{name_tag}] 广告清理失败：{e}")
+            errors.append(f"广告处理失败：{e}")
+            emit("error", f"[{name_tag}] 广告处理失败：{e}")
     if ad_kw and not errors:
         db.set_setting(sig_key, sig)
 
@@ -500,6 +546,34 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
         return _result(skipped=skipped)
     _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw)
     return _result(transferred, skipped, renamed, "; ".join(errors))
+
+
+def _unique_name(name: str, taken: set) -> str:
+    """同目录重名时在扩展名前加 (2)(3)…"""
+    if name not in taken:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        stem, ext = name, ""
+    for i in range(2, 1000):
+        cand = f"{stem} ({i}).{ext}" if ext else f"{stem} ({i})"
+        if cand not in taken:
+            return cand
+    return name
+
+
+def _rename_landed(client, dest, orig, final, ad_hit, name_tag, emit) -> int:
+    """转存落盘后改成最终名字（广告改名 + 批量重命名规则），返回 1（改了）或 0。"""
+    if final == orig:
+        emit("ok", f"[{name_tag}] 转存：{orig}")
+        return 0
+    try:
+        client.rename_in_dir(dest, orig, final)
+        emit("ok", f"[{name_tag}] 转存并改名{'（广告）' if ad_hit else ''}：{orig} → {final}")
+        return 1
+    except Exception as e:  # noqa: BLE001
+        emit("ok", f"[{name_tag}] 转存：{orig}（改名失败：{e}）")
+        return 0
 
 
 def _norm_target(path: str) -> str:

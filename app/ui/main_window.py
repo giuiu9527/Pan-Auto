@@ -352,6 +352,7 @@ class MainWindow(QWidget):
         self.settings.account_changed.connect(self.on_account_changed)
         self.friends.tasks_changed.connect(self.auto.reload_tasks)
         self.auto.tasks_changed.connect(self.friends.reload_sync_tasks)
+        self.auto.open_ad_settings.connect(lambda: self.navigate("adclean"))
 
         self.pages = {
             "home": self.home,

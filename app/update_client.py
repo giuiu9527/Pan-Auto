@@ -3,7 +3,14 @@
 方案按 `D:\\Test Code\\软件包更新方式.md`：服务端只是 OpenList 上的一个目录
 `/Pan-Auto`，里面固定名的 `update.json` 清单 + 带版本号的 zip + 同名 `.sha256`。
 客户端：读清单 → 按段比版本 → 下载 zip 到 %TEMP% → 校验 SHA-256 → 杀主程序 →
-写 .bat（UTF-8 带 BOM）→ `cmd.exe /c` 启动 → 退出；.bat 解压、xcopy 覆盖、重启主程序。
+写 .bat → `cmd.exe /c` 启动 → 退出；.bat 解压、xcopy 覆盖、重启主程序。
+
+「去哪更新」拆成两段（规范第 4 节）：
+  server  = 服务器地址（协议+主机+端口），换 IP 时用户在「更新服务器设置」里改这个
+  channel = 本软件清单的路径（不含主机）。以 `/` 结尾 = 旧公开分享目录，清单是 channel + update.json；
+            否则 = 签名直链，直接指向 update.json
+两者都有编译进来的默认值，用户配置（%APPDATA%\\Pan-Auto\\update_config.json）优先。
+主程序和 update.exe 读同一个文件、同一套拼接逻辑（都在本模块）。
 
 主程序只负责启动旁边的 `update.exe`（`launch_updater`）；下载/安装都在 `update.exe`
 （`updater_main.py` → `app/ui/updater_window.py`）里做，因为主程序运行时不能覆盖自己。
@@ -18,20 +25,23 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Callable, Optional
 
-from app.config import APP_NAME, APP_VERSION_PLAIN
+from app.config import APP_NAME, APP_VERSION_PLAIN, DATA_DIR
 
-# ★ OpenList 上 /Pan-Auto 目录的公开只读分享链接（在 OpenList 网页手动开分享后填入）。
-#   清单 = 该链接 + update.json；下载 = 该链接 + 清单里的 archive；校验 = 下载地址 + .sha256
-#   发布脚本 ci/win/publish_openlist.ps1 会从这里读取同一个值做发布后自检，别在两处各写一份。
-#   分享 id xIitmuVC：通过 POST /api/share/create 建的（files 必须写账号真实根路径下的绝对路径
-#   /谷歌云盘/软件收集/myAPP/Pan-Auto），公开 / 只读 / 无密码 / 2099 到期。
-UPDATE_PUBLIC_BASE = "http://209.146.116.186:5244/sd/xIitmuVC/"
-# 开发调试可用环境变量临时指到本地 http.server（发布包里不要设置它）
+# ★ 默认更新源（只用于全新安装 / 用户没改过的情况）。换服务器 IP 后，已安装的用户在
+#   update.exe 的「更新服务器设置」里改地址即可；这里的默认值随下一个版本一起改。
+#   全项目里服务器地址只允许出现在这里和发布脚本的兜底常量两处（规范第 0 节）。
+DEFAULT_SERVER = "http://38.65.91.124:5244"
+#   /Pan-Auto 的公开只读分享（旧方式，历史遗留，规范 2.2 表）。发布脚本 ci/win/publish_openlist.ps1
+#   从这里解析同一个值做发布后自检，别在两处各写一份。
+DEFAULT_CHANNEL = "/sd/xIitmuVC/"
+CONFIG_PATH = DATA_DIR / "update_config.json"
+# 开发调试可用环境变量把清单目录整个指到本地 http.server（发布包里不要设置它）
 _ENV_OVERRIDE = "PAN_AUTO_UPDATE_BASE"
 
 MAIN_EXE_NAME = "Pan-Auto.exe"
@@ -46,17 +56,106 @@ class UpdateError(RuntimeError):
     pass
 
 
-# ---- 地址 / 路径 ----
-def public_base() -> str:
-    base = os.environ.get(_ENV_OVERRIDE) or UPDATE_PUBLIC_BASE
-    base = (base or "").strip()
-    if base and not base.endswith("/"):
-        base += "/"
-    return base
+# ---- 更新源配置 ----
+def normalize_server(text: str) -> str:
+    """校验并规范化服务器地址：去空格和末尾 /，没协议自动补 http://，只允许 协议://主机[:端口]。"""
+    s = (text or "").strip().rstrip("/")
+    if not s:
+        raise ValueError("服务器地址不能为空")
+    if "://" not in s:
+        s = "http://" + s
+    u = urllib.parse.urlsplit(s)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("服务器地址必须以 http:// 或 https:// 开头")
+    if not u.hostname or u.path or u.query or u.fragment or "@" in u.netloc:
+        raise ValueError("服务器地址只能是「主机[:端口]」，不能带路径，例如 http://服务器IP:5244")
+    try:
+        u.port  # 端口不是数字会抛 ValueError
+    except ValueError as e:
+        raise ValueError("服务器地址里的端口不对") from e
+    return f"{u.scheme}://{u.netloc}"
+
+
+def normalize_channel(text: str) -> str:
+    """链接路径必须以 / 开头、不含主机。"""
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("链接路径不能为空")
+    if "://" in s or not s.startswith("/"):
+        raise ValueError("链接路径必须以 / 开头，且不能包含服务器地址")
+    return s
+
+
+def _read_config_file() -> dict:
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_config() -> dict:
+    """当前生效的更新源：{'server','channel','custom_server','custom_channel'}。配置里不合法的值忽略、回落默认。"""
+    raw = _read_config_file()
+    server, channel = DEFAULT_SERVER, DEFAULT_CHANNEL
+    custom_server = custom_channel = False
+    try:
+        if raw.get("server"):
+            server, custom_server = normalize_server(str(raw["server"])), True
+    except ValueError:
+        pass
+    try:
+        if raw.get("channel"):
+            channel, custom_channel = normalize_channel(str(raw["channel"])), True
+    except ValueError:
+        pass
+    return {"server": server, "channel": channel, "custom_server": custom_server, "custom_channel": custom_channel}
+
+
+def save_config(server: str, channel: str = "") -> dict:
+    """保存用户配置（先校验，不合法抛 ValueError）。和默认值相同的字段不写，以后默认值变了能跟着变。"""
+    data = {}
+    s = normalize_server(server)
+    if s != DEFAULT_SERVER:
+        data["server"] = s
+    if channel:
+        c = normalize_channel(channel)
+        if c != DEFAULT_CHANNEL:
+            data["channel"] = c
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return load_config()
+
+
+def reset_config() -> dict:
+    """恢复默认：清空用户配置（写成空对象，不删文件）。"""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text("{}", encoding="utf-8")
+    return load_config()
+
+
+def current_server() -> str:
+    return load_config()["server"]
+
+
+def manifest_url(server: Optional[str] = None, channel: Optional[str] = None) -> str:
+    """清单地址：channel 以 / 结尾（旧公开分享）→ server+channel+update.json；否则 server+channel。"""
+    env = os.environ.get(_ENV_OVERRIDE, "").strip()
+    if env and server is None and channel is None:
+        return env.rstrip("/") + "/update.json"
+    cfg = load_config()
+    server = normalize_server(server) if server is not None else cfg["server"]
+    channel = normalize_channel(channel) if channel is not None else cfg["channel"]
+    if channel.endswith("/"):
+        return server + channel + "update.json"
+    return server + channel
 
 
 def is_configured() -> bool:
-    return bool(public_base())
+    try:
+        return bool(manifest_url())
+    except ValueError:
+        return False
 
 
 def app_dir() -> Path:
@@ -155,42 +254,73 @@ def _http_get(url: str, timeout: float = REQUEST_TIMEOUT) -> bytes:
         raise UpdateError(f"网络请求失败：{getattr(e, 'reason', e)}") from e
 
 
-def fetch_manifest() -> dict:
-    """读 update.json；缺 version / archive 一律拒绝（不猜）。"""
-    if not is_configured():
-        raise UpdateError("尚未配置更新地址（UPDATE_PUBLIC_BASE 为空）")
-    raw = _http_get(public_base() + "update.json")
+def _server_of(url: str) -> str:
+    u = urllib.parse.urlsplit(url)
+    return f"{u.scheme}://{u.netloc}"
+
+
+def fetch_manifest(server: Optional[str] = None, channel: Optional[str] = None) -> dict:
+    """读 update.json 并算出包 / 校验文件的完整地址；缺必要字段一律拒绝（不猜）。
+
+    清单里只有文件名 `archive`（公开分享：和清单同目录）或不含主机的 `archive_path` /
+    `checksum_path`（签名直链：拼在 server 后面），任何字段都不带服务器地址。
+    """
+    url = manifest_url(server, channel)
+    raw = _http_get(url)
     try:
         data = json.loads(raw.decode("utf-8-sig"))
     except (ValueError, UnicodeDecodeError) as e:
-        raise UpdateError("更新清单不是合法 JSON") from e
+        raise UpdateError("更新清单不是合法 JSON（服务器地址或链接路径可能不对）") from e
     if not isinstance(data, dict):
         raise UpdateError("更新清单格式错误")
     version = str(data.get("version") or "").strip()
     archive = str(data.get("archive") or "").strip()
-    if not version or not archive:
+    archive_path = str(data.get("archive_path") or "").strip()
+    checksum_path = str(data.get("checksum_path") or "").strip()
+    if not version or not (archive or archive_path):
         raise UpdateError("更新清单缺少 version 或 archive，已拒绝")
-    if "/" in archive or "\\" in archive or ".." in archive:
-        raise UpdateError("更新清单里的 archive 必须是文件名")
+    host = _server_of(url)
+    if archive_path:
+        if not archive_path.startswith("/") or "://" in archive_path:
+            raise UpdateError("更新清单里的 archive_path 必须是以 / 开头、不含服务器地址的路径")
+        archive_url = host + archive_path
+        if checksum_path:
+            if not checksum_path.startswith("/") or "://" in checksum_path:
+                raise UpdateError("更新清单里的 checksum_path 格式不对")
+            checksum_url = host + checksum_path
+        else:
+            checksum_url = archive_url + ".sha256"
+        filename = urllib.parse.unquote(urllib.parse.urlsplit(archive_url).path.rsplit("/", 1)[-1])
+    else:
+        if "/" in archive or "\\" in archive or ".." in archive:
+            raise UpdateError("更新清单里的 archive 必须是文件名")
+        base = urllib.parse.urlsplit(url)
+        base_dir = base.path.rsplit("/", 1)[0] + "/"
+        archive_url = f"{base.scheme}://{base.netloc}{base_dir}{urllib.parse.quote(archive)}"
+        checksum_url = archive_url + ".sha256"
+        filename = archive
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        raise UpdateError("更新清单里的包文件名不合法")
     return {
         "version": version.lstrip("vV"),
-        "archive": archive,
+        "archive": filename,
+        "archive_url": archive_url,
+        "checksum_url": checksum_url,
         "notes": str(data.get("notes") or ""),
         "published_at": str(data.get("published_at") or ""),
+        "manifest_url": url,
     }
 
 
-def check() -> dict:
-    """{'local','remote','has_update','notes','archive'}"""
-    m = fetch_manifest()
+def check(server: Optional[str] = None, channel: Optional[str] = None) -> dict:
+    """{'local','remote','has_update','notes','archive','archive_url','checksum_url',...}"""
+    m = fetch_manifest(server, channel)
     local = local_version()
     return {
+        **m,
         "local": local,
         "remote": m["version"],
         "has_update": is_newer(m["version"], local),
-        "notes": m["notes"],
-        "archive": m["archive"],
-        "published_at": m["published_at"],
     }
 
 
@@ -202,11 +332,12 @@ def download_dir() -> Path:
 
 def download_archive(
     archive: str,
+    archive_url: str,
     progress: Optional[Callable[[int, int], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
 ) -> Path:
     """下载 zip 到 %TEMP%\\Pan-Auto-update\\（先写 .part，完成再改名）。返回 zip 路径。"""
-    url = public_base() + archive
+    url = archive_url
     dest = download_dir() / archive
     part = dest.with_suffix(dest.suffix + ".part")
     req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}-updater"})
@@ -226,7 +357,7 @@ def download_archive(
                     progress(done, total)
     except urllib.error.HTTPError as e:
         part.unlink(missing_ok=True)
-        raise UpdateError(f"下载失败 HTTP {e.code}（包可能还没同步到公开链接，稍后再试）") from e
+        raise UpdateError(f"下载失败 HTTP {e.code}（包可能还没同步到服务器，稍后再试）") from e
     except (urllib.error.URLError, OSError) as e:
         part.unlink(missing_ok=True)
         raise UpdateError(f"下载失败：{getattr(e, 'reason', e)}") from e
@@ -247,9 +378,9 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def verify_archive(zip_path: Path, archive: str) -> None:
-    """下载同名 .sha256（`hex  文件名` 格式，只取第一个空格前），不一致删 zip 并报错。"""
-    raw = _http_get(public_base() + archive + ".sha256")
+def verify_archive(zip_path: Path, checksum_url: str) -> None:
+    """下载 .sha256（`hex  文件名` 格式，只取第一个空格前），不一致删 zip 并报错。"""
+    raw = _http_get(checksum_url)
     expected = raw.decode("ascii", "ignore").strip().split()[0].lower() if raw.strip() else ""
     if len(expected) != 64:
         zip_path.unlink(missing_ok=True)

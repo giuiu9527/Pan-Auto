@@ -10,7 +10,7 @@ Pan-Auto 一键发版（OpenList 方案，见 docs/UPDATE.md）
   .\release.ps1 -Version 3.0.1 -SkipBuild             # 用现有 dist\Pan-Auto 打包（调试用）
   .\release.ps1 -Version 3.0.1 -SkipPublish           # 只打包不发布
 
-发布前提：用户环境变量 OPENLIST_USERNAME / OPENLIST_PASSWORD；app/update_client.py 里已填公开分享链接。
+发布前提：用户环境变量 OPENLIST_BASE_URL / OPENLIST_USERNAME / OPENLIST_PASSWORD（见 docs/UPDATE.md）。
 #>
 [CmdletBinding()]
 param(

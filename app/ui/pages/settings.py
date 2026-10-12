@@ -24,7 +24,8 @@ from app.ui.icons import make_pixmap
 from app.ui.login_dialog import LoginDialog
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.widgets import (
-    card, field_label, hint, button, PageHeader, SegmentBar, StatusPill, ElidedLabel,
+    ComboBox,
+    card, field_label, field_group, hint, button, PageHeader, SegmentBar, StatusPill, ElidedLabel,
     page_root, InfoBox,
 )
 
@@ -115,9 +116,9 @@ class SettingsPage(QWidget):
         self.list_lay.setSpacing(8)
         self.list_lay.addStretch()
         self.scroll.setWidget(self.list_host)
-        self.scroll.setMinimumHeight(200)
+        self.scroll.setMinimumHeight(120)
         al.addWidget(self.scroll, 1)
-        left.addWidget(acc_card, 3)
+        left.addWidget(acc_card, 0)
 
         gen_card = card()
         gl = QVBoxLayout(gen_card)
@@ -130,10 +131,7 @@ class SettingsPage(QWidget):
         self.autostart_cb.setChecked(is_autostart_enabled())
         self.autostart_cb.toggled.connect(self._on_autostart_toggled)
         gl.addWidget(self.autostart_cb)
-        close_row = QHBoxLayout()
-        close_row.setSpacing(10)
-        close_row.addWidget(field_label("点关闭按钮时"))
-        self.close_action = QComboBox()
+        self.close_action = ComboBox()
         self.close_action.addItem("每次询问", "ask")
         self.close_action.addItem("最小化到托盘", "minimize")
         self.close_action.addItem("退出程序", "quit")
@@ -141,11 +139,12 @@ class SettingsPage(QWidget):
         idx = self.close_action.findData(cur)
         self.close_action.setCurrentIndex(idx if idx >= 0 else 0)
         self.close_action.currentIndexChanged.connect(self._on_close_action_changed)
-        self.close_action.setFixedWidth(170)
-        close_row.addWidget(self.close_action)
-        close_row.addStretch()
-        gl.addLayout(close_row)
+        self.close_action.setFixedWidth(200)
+        close_box = field_group("点右上角关闭按钮时", self.close_action,
+                                "选「最小化到托盘」后，程序在后台继续按计划同步")
+        gl.addWidget(close_box)
         left.addWidget(gen_card, 0)
+        left.addStretch(1)
 
         # ===== 右列：添加账号 + 目录预览 =====
         right = QVBoxLayout()

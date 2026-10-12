@@ -88,6 +88,9 @@ QPushButton#NavItem:checked {{
     background: {PRIMARY_SOFT}; color: {PRIMARY}; font-weight: 600;
     border-left: 3px solid {PRIMARY};
 }}
+QWidget#Sidebar[compact="true"] QPushButton#NavItem {{
+    padding: 0; text-align: center; border-left: 3px solid transparent;
+}}
 QFrame#AccountCard {{
     background: #F8FAFD; border: 1px solid {BORDER}; border-radius: 10px;
 }}
@@ -137,16 +140,22 @@ QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus, QTextEdi
 QLineEdit:read-only {{ background: #F8FAFD; color: {TEXT_2}; }}
 QLineEdit:disabled, QComboBox:disabled {{ background: #F3F4F6; color: {MUTED_2}; }}
 QLineEdit::placeholder {{ color: {MUTED_2}; }}
+QComboBox {{ combobox-popup: 0; }}
 QComboBox::drop-down {{ border: none; width: 26px; subcontrol-origin: padding; subcontrol-position: center right; }}
 QComboBox::down-arrow {{ image: url("{_CHEVRON_SVG}"); width: 12px; height: 12px; margin-right: 8px; }}
+/* 下拉弹层：普通列表（combobox-popup:0），行高 32px，悬停/选中浅蓝底 */
 QComboBox QAbstractItemView {{
-    border: 1px solid {BORDER}; border-radius: 8px; background: {CARD};
+    border: 1px solid {BORDER_STRONG}; border-radius: 8px; background: {CARD};
     selection-background-color: {PRIMARY_SOFT}; selection-color: {PRIMARY};
     padding: 4px; outline: none;
 }}
-QComboBox QAbstractItemView::item {{ min-height: 30px; padding: 0 8px; }}
-QComboBox#Compact {{ min-height: 28px; max-height: 28px; padding: 0 6px; font-size: 12px; }}
-QComboBox#Compact::drop-down {{ width: 20px; }}
+QComboBox QAbstractItemView::item {{
+    min-height: 32px; padding: 0 10px; border-radius: 6px; color: {TEXT};
+}}
+QComboBox QAbstractItemView::item:hover {{ background: #F4F7FD; color: {TEXT}; }}
+QComboBox QAbstractItemView::item:selected {{ background: {PRIMARY_SOFT}; color: {PRIMARY}; }}
+QComboBox#Compact {{ min-height: 28px; max-height: 28px; padding: 0 8px; font-size: 12px; }}
+QComboBox#Compact::drop-down {{ width: 22px; }}
 
 /* ---- 按钮 ---- */
 QPushButton {{ border-radius: 8px; }}
@@ -292,11 +301,11 @@ QPushButton#StatusAction {{
 }}
 QPushButton#StatusAction:hover {{ background: {PRIMARY_SOFT}; }}
 
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: #D3D9E4; border-radius: 4px; min-height: 30px; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px 1px; }}
+QScrollBar::handle:vertical {{ background: #DCE1EA; border-radius: 3px; min-height: 36px; }}
 QScrollBar::handle:vertical:hover {{ background: #B4BCCB; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-QScrollBar::handle:horizontal {{ background: #D3D9E4; border-radius: 4px; min-width: 30px; }}
+QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 1px 2px; }}
+QScrollBar::handle:horizontal {{ background: #DCE1EA; border-radius: 3px; min-width: 36px; }}
 QScrollBar::handle:horizontal:hover {{ background: #B4BCCB; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}

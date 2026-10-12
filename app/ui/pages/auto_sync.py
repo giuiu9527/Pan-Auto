@@ -30,6 +30,7 @@ from app.ui.icons import make_icon
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.group_picker import GroupPickerPopup
 from app.ui.widgets import (
+    ComboBox,
     card, field_group, hint, button, square_button, icon_button, input_with_button,
     SegmentBar, PageHeader, TwoColumn, scroll_wrap, setup_table, table_frame,
     actions_cell, pill_cell, fmt_time, InfoBox, two_line_cell,
@@ -40,13 +41,16 @@ DEFAULT_TARGET = "/来自好友的分享"
 
 
 def _short_time(ts) -> str:
-    """今天只显示 时:分，其它日期带 月-日。"""
+    """今天只显示 时:分，明天写「明天 时:分」，其它日期带 月-日。"""
     import time as _t
 
     if not ts:
         return ""
-    if _t.strftime("%Y%m%d", _t.localtime(ts)) == _t.strftime("%Y%m%d"):
+    day = _t.strftime("%Y%m%d", _t.localtime(ts))
+    if day == _t.strftime("%Y%m%d"):
         return fmt_time(ts, "%H:%M")
+    if day == _t.strftime("%Y%m%d", _t.localtime(_t.time() + 86400)):
+        return "明天 " + fmt_time(ts, "%H:%M")
     return fmt_time(ts)
 
 
@@ -95,7 +99,7 @@ class AutoSyncPage(QWidget):
         """右栏太窄时隐藏「频率」列（仍可通过更多 → 编辑修改），保证任务名可读。"""
         if not hasattr(self, "table"):
             return
-        narrow = self.table.viewport().width() < 480
+        narrow = self.table.viewport().width() < 430
         self.table.setColumnHidden(1, narrow)
 
     # ================= 左：表单 =================
@@ -122,7 +126,7 @@ class AutoSyncPage(QWidget):
         self.seg.changed.connect(self.set_tab)
         fl.addWidget(self.seg)
 
-        self.account = QComboBox()
+        self.account = ComboBox()
         fl.addWidget(field_group("转存到哪个账号", self.account))
 
         self.input_stack = QStackedWidget()
@@ -135,15 +139,17 @@ class AutoSyncPage(QWidget):
         self.target.setPlaceholderText("/来自好友的分享")
         pick = square_button("folder", "浏览网盘选择文件夹")
         pick.clicked.connect(self.pick_folder)
-        fl.addWidget(field_group("保存位置", input_with_button(self.target, pick),
-                                 "群文件夹任务会落到「保存位置/文件夹名」，多次同步就地更新，不再生成副本"))
+        self.target_group = field_group("保存位置", input_with_button(self.target, pick),
+                                        self.TARGET_HINT_GROUP)
+        self.target_group.hint_label.setVisible(False)   # 分享链接模式不需要这句，省出一屏空间
+        fl.addWidget(self.target_group)
 
-        self.interval = QComboBox()
+        self.interval = ComboBox()
         for key in INTERVAL_CHOICES:
             self.interval.addItem(interval_label(key), key)
         self.interval.setCurrentIndex(self.interval.findData(DEFAULT_INTERVAL))
         fl.addWidget(field_group("同步频率", self.interval,
-                                 "频率越高越容易触发网盘风控；群文件夹每次都要遍历整棵目录，建议 30 分钟以上"))
+                                 "频率越高越容易触发网盘风控，建议 30 分钟以上"))
 
         self.rename_on = QCheckBox("同步后按「批量重命名」里的规则自动改名")
         fl.addWidget(self.rename_on)
@@ -209,9 +215,12 @@ class AutoSyncPage(QWidget):
                                  "选整群 = 同步群里所有新文件；选具体文件夹 = 只保留该文件夹内容（含深层新增）"))
         return w
 
+    TARGET_HINT_GROUP = "群文件夹会落到「保存位置/文件夹名」，多次同步就地更新，不再生成副本"
+
     def set_tab(self, mode: str):
         self.mode = mode
         self.input_stack.setCurrentIndex(0 if mode == "share" else 1)
+        self.target_group.hint_label.setVisible(mode != "share")
 
     def open_group_picker(self):
         acc_id = self.account.currentData()
@@ -259,9 +268,9 @@ class AutoSyncPage(QWidget):
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
         hh.setSectionResizeMode(3, QHeaderView.Fixed)
-        self.table.setColumnWidth(1, 104)
-        self.table.setColumnWidth(2, 140)
-        self.table.setColumnWidth(3, 104)
+        self.table.setColumnWidth(1, 124)
+        self.table.setColumnWidth(2, 150)
+        self.table.setColumnWidth(3, 118)
         rl.addWidget(table_frame(self.table), 1)
 
         rl.addWidget(InfoBox(
@@ -479,8 +488,9 @@ class AutoSyncPage(QWidget):
                 theme.PRIMARY if kind == "share" else "#7C3AED",
             ))
 
-            freq = QComboBox()
+            freq = ComboBox()
             freq.setObjectName("Compact")
+            freq.setFixedWidth(108)
             freq.setCursor(Qt.PointingHandCursor)
             keys = list(INTERVAL_CHOICES)
             if t["interval"] in INTERVAL_SECONDS and t["interval"] not in keys:
@@ -500,24 +510,35 @@ class AutoSyncPage(QWidget):
             self.table.setCellWidget(r, 1, cell)
 
             fails = int(t.get("fail_count") or 0)
+            tip = ""
             if t["id"] in running:
                 stxt, kind_ = "运行中", "primary"
+                tip = "正在同步，完成后自动刷新"
             elif not t["enabled"]:
                 stxt, kind_ = "已暂停", "muted"
+                tip = "定时同步已暂停（点右边的播放按钮恢复）"
             elif fails:
                 nxt = next_run_ts(t)
-                stxt, kind_ = f"失败 {fails} 次 · {_short_time(nxt)} 重试", "danger"
+                stxt, kind_ = f"{_short_time(nxt)} 重试", "danger"
+                tip = f"已连续失败 {fails} 次，将在 {_short_time(nxt)} 重试（失败越多等待越久）"
             else:
                 nxt = next_run_ts(t)
-                stxt, kind_ = (f"下次 {_short_time(nxt)}", "success") if nxt else ("等待首次同步", "info")
-            self.table.setCellWidget(r, 2, pill_cell(stxt, kind_))
+                if nxt:
+                    stxt, kind_ = f"下次 {_short_time(nxt)}", "success"
+                    tip = f"下次同步时间：{fmt_time(nxt, '%Y-%m-%d %H:%M')}"
+                else:
+                    stxt, kind_ = "等待首次同步", "info"
+                    tip = "新任务会在调度器下一轮扫描时立即同步"
+            pc = pill_cell(stxt, kind_)
+            pc.setToolTip(tip)
+            self.table.setCellWidget(r, 2, pc)
 
-            run_b = icon_button("play", theme.PRIMARY, "立即同步（只转新增）")
+            run_b = icon_button("refresh", theme.PRIMARY, "立即同步（只转新增）")
             run_b.clicked.connect(lambda _=False, tt=dict(t): self.run_now(tt))
             toggle_b = icon_button(
                 "pause" if t["enabled"] else "play",
                 theme.WARNING if t["enabled"] else theme.SUCCESS,
-                "暂停" if t["enabled"] else "启用",
+                "暂停定时同步" if t["enabled"] else "恢复定时同步",
             )
             toggle_b.clicked.connect(lambda _=False, tid=t["id"], en=t["enabled"]: self.toggle(tid, en))
             more_b = icon_button("more", theme.TEXT_2, "更多：编辑 / 重新同步 / 删除")

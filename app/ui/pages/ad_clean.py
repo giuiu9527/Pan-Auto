@@ -31,6 +31,7 @@ from app.quark.client import display_path
 from app.ui.icons import make_icon
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.widgets import (
+    ComboBox,
     card, field_group, button, square_button, icon_button, input_with_button,
     PageHeader, TwoColumn, scroll_wrap, setup_table, table_frame, fmt_size,
     EmptyState, label, hint,
@@ -146,7 +147,7 @@ class AdCleanPage(QWidget):
         fl.setContentsMargins(18, 16, 18, 18)
         fl.setSpacing(14)
 
-        self.action = QComboBox()
+        self.action = ComboBox()
         self.action.addItem("改名：按下面的广告词规则改掉广告名字", adfilter.ACTION_REPLACE)
         self.action.addItem("跳过：不转存（网盘里已有的会被删除）", adfilter.ACTION_SKIP)
         cur = db.get_setting("ad_action", adfilter.ACTION_SKIP)
@@ -204,7 +205,7 @@ class AdCleanPage(QWidget):
         sl.setSpacing(14)
         sl.addWidget(label("手动扫描清理", "SectionTitle"))
 
-        self.account = QComboBox()
+        self.account = ComboBox()
         sl.addWidget(field_group("账号", self.account))
 
         self.folder_edit = QLineEdit("/")

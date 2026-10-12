@@ -133,6 +133,8 @@ class NavButton(QPushButton):
     def __init__(self, icon_name: str, text: str):
         super().__init__("  " + text)
         self.icon_name = icon_name
+        self.full_text = "  " + text
+        self.label_text = text
         self.setObjectName("NavItem")
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -143,6 +145,10 @@ class NavButton(QPushButton):
 
     def _update_icon(self, checked: bool):
         self.setIcon(make_icon(self.icon_name, theme.PRIMARY if checked else theme.TEXT_2, 18))
+
+    def set_compact(self, compact: bool):
+        self.setText("" if compact else self.full_text)
+        self.setToolTip(self.label_text if compact else "")
 
 
 class AccountCard(QFrame):
@@ -166,6 +172,13 @@ class AccountCard(QFrame):
         col.addWidget(self.sub)
         lay.addLayout(col, 1)
         self._set_avatar(False)
+
+    def set_compact(self, compact: bool):
+        self.name.setVisible(not compact)
+        self.sub.setVisible(not compact)
+        lay = self.layout()
+        lay.setContentsMargins(*((7, 7, 7, 7) if compact else (10, 8, 10, 8)))
+        self.setToolTip(f"{self.name.text()} · {self.sub.text()}" if compact else "")
 
     def _set_avatar(self, active: bool):
         self.avatar.setStyleSheet(
@@ -192,10 +205,15 @@ class AccountCard(QFrame):
 
 
 class Sidebar(QWidget):
+    FULL_WIDTH = 204
+    COMPACT_WIDTH = 68
+
     def __init__(self, on_nav):
         super().__init__()
         self.setObjectName("Sidebar")
-        self.setFixedWidth(212)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._compact = False
+        self.setFixedWidth(self.FULL_WIDTH)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -220,17 +238,21 @@ class Sidebar(QWidget):
         col.addWidget(ver)
         bl.addLayout(col)
         bl.addStretch()
+        self._brand_layout = bl
+        self._brand_text = [name, ver]
         lay.addWidget(brand)
 
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
         self.buttons: dict[str, QPushButton] = {}
+        self._sections: list[QLabel] = []
         last_section = None
         for key, text, icon, section in NAV:
             if section != last_section:
                 sec = QLabel(section)
                 sec.setObjectName("NavSection")
                 lay.addWidget(sec)
+                self._sections.append(sec)
                 last_section = section
             btn = NavButton(icon, text)
             btn.clicked.connect(lambda _=False, k=key: on_nav(k))
@@ -249,6 +271,26 @@ class Sidebar(QWidget):
 
     def refresh_account(self):
         self.card.refresh()
+        if self._compact:
+            self.card.set_compact(True)
+
+    def set_compact(self, compact: bool):
+        """窗口较窄时侧边栏只留图标，把宽度让给右边的任务表。"""
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self.setFixedWidth(self.COMPACT_WIDTH if compact else self.FULL_WIDTH)
+        self.setProperty("compact", "true" if compact else "false")
+        for w in self._brand_text:
+            w.setVisible(not compact)
+        self._brand_layout.setContentsMargins(*((18, 16, 18, 12) if compact else (18, 16, 14, 12)))
+        for sec in self._sections:
+            sec.setVisible(not compact)
+        for btn in self.buttons.values():
+            btn.set_compact(compact)
+        self.card.set_compact(compact)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 class UpdateCheckWorker(QThread):
@@ -514,6 +556,14 @@ class MainWindow(QWidget):
         super().changeEvent(e)
         if e.type() == QEvent.WindowStateChange and hasattr(self, "titlebar"):
             self.titlebar.refresh_state()
+
+    # 窗口宽度小于该值时侧边栏收成只留图标
+    COMPACT_BELOW = 1240
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "sidebar"):
+            self.sidebar.set_compact(self.width() < self.COMPACT_BELOW)
 
     # ---- 更新（OpenList 方案：主程序只负责拉起 update.exe）----
     def check_updates_on_startup(self):

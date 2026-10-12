@@ -25,6 +25,7 @@ from app.baidu.client import get_client_for_account
 from app.ui.icons import make_icon, make_pixmap
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.widgets import (
+    ComboBox,
     card, field_group, field_label, hint, button, icon_button, PageHeader, TwoColumn,
     scroll_wrap, setup_table, table_frame, pill_cell, EmptyState, ElidedLabel, InfoBox,
 )
@@ -168,7 +169,7 @@ class AdInsertPage(QWidget):
         fl.setContentsMargins(18, 16, 18, 18)
         fl.setSpacing(14)
 
-        self.account = QComboBox()
+        self.account = ComboBox()
         fl.addWidget(field_group("执行账号", self.account))
 
         fl.addWidget(field_label("插入方式"))

@@ -35,6 +35,7 @@ from app.core.transfer import (
 from app.ui.icons import make_icon
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.widgets import (
+    ComboBox,
     card, field_group, button, square_button, icon_button, input_with_button,
     SegmentBar, PageHeader, TwoColumn, setup_table, table_frame, actions_cell,
     pill_cell, fmt_size, fmt_time, label,
@@ -201,7 +202,7 @@ class FriendMessagePage(QWidget):
 
         ll.addWidget(PageHeader("好友 / 群文件", "手动挑选转存，或加入定时同步"))
 
-        self.account = QComboBox()
+        self.account = ComboBox()
         self.account.currentIndexChanged.connect(lambda _=0: self.reload_entities())
         ll.addWidget(field_group("百度账号", self.account))
 
@@ -312,7 +313,7 @@ class FriendMessagePage(QWidget):
 
         opts = QHBoxLayout()
         opts.setSpacing(12)
-        self.interval = QComboBox()
+        self.interval = ComboBox()
         self.interval.setObjectName("Compact")
         for key in INTERVAL_CHOICES:
             self.interval.addItem(interval_label(key), key)

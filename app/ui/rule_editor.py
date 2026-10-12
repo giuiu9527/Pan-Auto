@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt
 
 from app import theme
 from app.core.rename import RULE_TYPES, apply_rules
-from app.ui.widgets import button, hint, field_label, table_frame
+from app.ui.widgets import button, hint, field_label, table_frame, ComboBox
 
 
 class RuleEditor(QWidget):
@@ -56,7 +56,7 @@ class RuleEditor(QWidget):
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 112)
+        self.table.setColumnWidth(0, 132)
         self.table.setMinimumHeight(120)
         self.table.setMaximumHeight(170)
         self.table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -90,7 +90,7 @@ class RuleEditor(QWidget):
         rule = rule or {"rule_type": "remove", "pattern": "", "replacement": ""}
         r = self.table.rowCount()
         self.table.insertRow(r)
-        combo = QComboBox()
+        combo = ComboBox()
         combo.setObjectName("Compact")
         for key, name in RULE_TYPES.items():
             combo.addItem(name, key)

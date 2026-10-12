@@ -17,12 +17,28 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QScrollArea,
+    QComboBox,
 )
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QFontMetrics
 
 from app.ui.icons import make_icon, make_pixmap
 from app import theme
+
+
+class ComboBox(QComboBox):
+    """全站统一的下拉框：弹层至少和最长选项一样宽（以前弹层和下拉框等宽，窄下拉框里选项被截断）。
+
+    配合 theme 里的 `combobox-popup: 0` + QListView 样式：行高 32px、悬停/选中为浅蓝底，
+    不再是系统菜单式的 24px 紧凑行 + 深蓝高亮。
+    """
+
+    def showPopup(self):
+        fm = self.fontMetrics()
+        longest = max((fm.horizontalAdvance(self.itemText(i)) for i in range(self.count())), default=0)
+        view = self.view()
+        view.setMinimumWidth(max(self.width(), longest + 56))   # 左右内边距 + 滚动条余量
+        super().showPopup()
 
 
 # ---- 基础 ----
@@ -76,8 +92,10 @@ def field_group(text: str, widget: QWidget, hint_text: str = "") -> QWidget:
     lay.setSpacing(6)
     lay.addWidget(field_label(text))
     lay.addWidget(widget)
+    w.hint_label = None
     if hint_text:
-        lay.addWidget(hint(hint_text))
+        w.hint_label = hint(hint_text)
+        lay.addWidget(w.hint_label)
     return w
 
 

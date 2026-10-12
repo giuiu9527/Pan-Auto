@@ -23,6 +23,7 @@ from app.netdisk import account_display_name
 from app.ui.netdisk_browser import NetdiskBrowser
 from app.ui.rule_editor import RuleEditor
 from app.ui.widgets import (
+    ComboBox,
     card, field_group, field_label, hint, button, square_button, icon_button,
     input_with_button, PageHeader, TwoColumn, scroll_wrap, setup_table, table_frame,
     pill_cell, EmptyState,
@@ -83,7 +84,7 @@ class BatchRenamePage(QWidget):
         fl.setContentsMargins(18, 16, 18, 18)
         fl.setSpacing(14)
 
-        self.account = QComboBox()
+        self.account = ComboBox()
         fl.addWidget(field_group("账号", self.account))
 
         self.folder = QLineEdit("/")

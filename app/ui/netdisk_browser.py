@@ -164,7 +164,7 @@ class NetdiskBrowser(QWidget):
     def _on_error(self, msg: str):
         self.refresh_btn.setEnabled(True)
         if msg == "未登录":
-            self.status.setText("请先在「设置」中登录网盘账号")
+            self.status.setText("还没有登录网盘账号，请先添加账号")
         else:
             self.status.setText(f"加载失败：{msg}")
 

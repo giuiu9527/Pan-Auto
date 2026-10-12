@@ -246,8 +246,12 @@ def run_task(task: dict, log: Optional[LogFn] = None) -> dict:
                 else:
                     res = _run_share_task(task, log)
             except Exception as e:  # noqa: BLE001  兜底：任何未预期异常都不能让调度器崩
-                db.add_log("error", f"任务执行异常：{e}", tid)
-                res = _result(error=str(e))
+                import traceback
+
+                tb = traceback.extract_tb(e.__traceback__)
+                where = f"{tb[-1].filename.rsplit(chr(92), 1)[-1]}:{tb[-1].lineno}" if tb else ""
+                db.add_log("error", f"任务执行异常：{type(e).__name__}: {e}（位置 {where}）", tid)
+                res = _result(error=f"{type(e).__name__}: {e}")
             db.set_task_last_run(tid)
             db.bump_task_fail_count(tid, failed=bool(res.get("error")))
             return res
@@ -407,7 +411,10 @@ def _scan_share_tree(client, meta, task_id, ad_kw, ad_wl,
                 truncated = True
                 continue
             dirs += 1
-            items = client.list_share_dir(meta, path)   # 报错上抛：列不出来不能当成「没文件」
+            try:
+                items = client.list_share_dir(meta, path)   # 报错上抛：列不出来不能当成「没文件」
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"读取分享里的目录「{path or '/'}」失败：{e}") from e
             time.sleep(0.2)
         subdirs = []
         for f in items:
@@ -482,6 +489,7 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
 
     transferred = 0
     renamed = 0
+    failed_total = 0
     errors: list[str] = []
     for rel, flist in groups.items():
         dest = _mirror_dir(target_dir, rel)
@@ -492,8 +500,12 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
                 existing = set()
                 client.resolve_target(dest)     # 建目录；已存在不会生成副本
         except Exception as e:  # noqa: BLE001
-            errors.append(str(e))
-            emit("error", f"[{name_tag}] 处理目录 {dest} 失败：{e}")
+            failed_total += len(flist)
+            errors.append(f"{dest}：目录处理失败（{e}）")
+            names = "、".join(f["server_filename"] for f in flist[:5]) + (
+                f" 等 {len(flist)} 个" if len(flist) > 5 else "")
+            emit("error", f"[{name_tag}] 无法处理目标目录 {dest}（{e}），这个目录里的 {len(flist)} 个"
+                          f"新文件本次都没转存：{names}。下次同步会自动重试")
             continue
         # 先定每个文件最终叫什么：普通文件先占名，广告改名的再避让，绝不去改普通文件的名字
         taken = set(existing)
@@ -515,15 +527,35 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
             fresh.append((f, final))
         for batch in _chunks(fresh, 100):
             res = client.save_files(meta, [f for f, _ in batch], dest)
+            landed_names: set = set()
             if res.get("error"):
-                errors.append(res["error"])
-                emit("error", f"[{name_tag}] {dest}：{res['error']}")
-                continue
+                # 失败不等于一个都没进来（超时、部分文件失败时服务端常已完成一部分）：
+                # 列一下目标目录，真正落盘的记为成功，只把确实没进来的算失败
+                try:
+                    landed_names = {i.get("server_filename") for i in client.list_dir(dest)}
+                except Exception:  # noqa: BLE001
+                    landed_names = set()
+            ok_ids = {str(x) for x in (res.get("ok_fs_ids") or [])}
+            bad = {str(x.get("fs_id")): x for x in (res.get("failed") or [])}
+            failed_here = []
             for f, final in batch:
-                db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
-                transferred += 1
-                renamed += _rename_landed(client, dest, f["server_filename"], final,
-                                          bool(f.get("_final_name")), name_tag, emit)
+                fid = str(f["fs_id"])
+                landed = (not res.get("error")) or fid in ok_ids or (
+                    fid not in bad and (f["server_filename"] in landed_names or final in landed_names))
+                if landed:
+                    db.mark_transferred(task_id, client.share_key(meta, f), f["server_filename"])
+                    transferred += 1
+                    renamed += _rename_landed(client, dest, f["server_filename"], final,
+                                              bool(f.get("_final_name")), name_tag, emit)
+                else:
+                    failed_here.append((f, bad.get(fid)))
+            if failed_here:
+                failed_total += len(failed_here)
+                reason = res.get("error") or "未知原因"
+                errors.append(f"{dest}：{len(failed_here)} 个文件转存失败（{reason}）")
+                emit("error", _describe_failure(name_tag, dest, failed_here, reason, len(batch)))
+            elif res.get("error"):
+                emit("info", f"[{name_tag}] {dest}：百度返回了「{res['error']}」，但核对后文件都已在目标里，已按成功处理")
             time.sleep(random.uniform(DEFAULT_MIN_DELAY, DEFAULT_MAX_DELAY))
 
     # 目标目录里已有的广告：有新转存、或广告设置刚改过时处理一遍（跳过模式=删除，替换/改名模式=改名）
@@ -548,15 +580,36 @@ def _share_deep(client, meta, task, target_dir, ad_kw, ad_wl, rules, name_tag, e
                     emit("info", f"[{name_tag}] 已把 {n} 个广告文件/文件夹改名：{shown}")
         except Exception as e:  # noqa: BLE001
             errors.append(f"广告处理失败：{e}")
-            emit("error", f"[{name_tag}] 广告处理失败：{e}")
+            emit("error", f"[{name_tag}] 广告处理失败（目标目录 {_norm_target(target_dir)}）：{e}。"
+                          "新文件已转存，只是清理/改名广告这一步没做完，下次同步会再试")
     if ad_kw and not errors:
         db.set_setting(sig_key, sig)
 
     if not transferred and not errors:
         _quiet_done(emit, name_tag, skipped)
         return _result(skipped=skipped)
-    _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw)
+    _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw,
+             failed_files=failed_total, dirs=dirs)
     return _result(transferred, skipped, renamed, "; ".join(errors))
+
+
+def _describe_failure(name_tag: str, dest: str, failed_here: list, reason: str, batch_size: int) -> str:
+    """一条失败记录：哪个目录、几个文件、哪些文件、什么原因（含百度给的逐文件原因）。"""
+    names = []
+    per_file = {}
+    for f, info in failed_here:
+        names.append(f["server_filename"])
+        if info and info.get("reason"):
+            per_file[f["server_filename"]] = info["reason"]
+    shown = "、".join(names[:5]) + (f" 等 {len(names)} 个" if len(names) > 5 else "")
+    msg = f"[{name_tag}] 转存失败：目录 {dest}，这一批 {batch_size} 个文件里有 {len(failed_here)} 个没成功"
+    msg += f"；原因：{reason}"
+    if per_file:
+        reasons = sorted(set(per_file.values()))
+        msg += f"；逐文件原因：{'；'.join(reasons[:3])}"
+    msg += f"；文件：{shown}"
+    msg += "。下次同步会自动重试这些文件"
+    return msg
 
 
 def _unique_name(name: str, taken: set) -> str:
@@ -721,7 +774,9 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
                 )
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
-            emit("error", f"[{name_tag}] 转存请求失败：{e}")
+            nm = "、".join(f["server_filename"] for f in new_files[:5]) + (
+                f" 等 {len(new_files)} 个" if len(new_files) > 5 else "")
+            emit("error", f"[{name_tag}] 转存请求失败（{type(e).__name__}）：{e}；本批 {len(new_files)} 个文件：{nm}")
             continue
 
         errno = res.get("errno")
@@ -744,7 +799,9 @@ def _run_msg_task(task: dict, log: Optional[LogFn] = None) -> dict:
 
             m = _share_err(errno, "转存失败")
             errors.append(m)
-            emit("error", f"[{name_tag}] {m}")
+            nm = "、".join(f["server_filename"] for f in new_files[:5]) + (
+                f" 等 {len(new_files)} 个" if len(new_files) > 5 else "")
+            emit("error", f"[{name_tag}] {m}；本批 {len(new_files)} 个文件没转存：{nm}；下次同步会重试")
             continue
 
         for f in new_files:
@@ -815,10 +872,16 @@ def _quiet_done(emit, name_tag, skipped):
     emit("skip", f"[{name_tag}] 无新增（已同步 {skipped} 项）")
 
 
-def _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw=None):
+def _summary(emit, name_tag, transferred, skipped, renamed, errors, ad_kw=None,
+             failed_files: int = 0, dirs: int = 0):
     summary = f"[{name_tag}] 完成：新增 {transferred}，跳过 {skipped}，改名 {renamed}"
     if errors:
-        summary += f"，失败 {len(errors)}"
+        if failed_files:
+            summary += f"，失败 {failed_files} 个文件（共 {len(errors)} 处，原因见同一时间的红色失败记录）"
+        else:
+            summary += f"，失败 {len(errors)} 处（原因见同一时间的红色失败记录）：" + "；".join(errors[:2])
+    if dirs:
+        summary += f"；扫描了 {dirs + 1} 个目录"
     if ad_kw:
         custom = db.get_setting("ad_keywords", None) is not None
         summary += f"；本次按 {len(ad_kw)} 个广告词过滤" + ("" if custom else "（默认词表，未保存自定义词）")

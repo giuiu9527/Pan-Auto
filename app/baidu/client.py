@@ -617,7 +617,7 @@ class BaiduPanClient:
                 "path": target_dir,
             },
             headers={"Referer": ref},
-            timeout=30,
+            timeout=90,
         )
         return r.json()
 
@@ -857,18 +857,49 @@ class BaiduPanClient:
         return target
 
     def save_files(self, meta: dict, files: list[dict], target_ref: str) -> dict:
-        """转存指定文件到 target_ref，返回 {"error": str|None}。"""
+        """转存指定文件到 target_ref。
+
+        返回 {"error": str|None, "errno", "show_msg", "failed": [{fs_id,name,reason}], "ok_fs_ids": [...]}。
+        error 为空表示整批成功；失败时尽量带上百度返回的**每个文件**的结果（`info`），
+        让上层能写出「哪个文件、为什么」，而不是只有一句「失败」。
+        """
         fsidlist = [f["fs_id"] for f in files]
+        name_of = {str(f["fs_id"]): f.get("server_filename", "") for f in files}
         try:
             res = self.transfer_files(
                 meta["shareid"], meta["uk"], fsidlist, target_ref, meta["ref"]
             )
-        except Exception as e:  # noqa: BLE001
-            return {"error": str(e)}
+        except Exception as e:  # noqa: BLE001  网络超时/断开：服务端可能已部分完成，由上层核对落盘情况
+            kind = type(e).__name__
+            msg = str(e)
+            if "timed out" in msg.lower() or "Timeout" in kind:
+                msg = "请求超时（百度处理太久没回应，文件可能已经转存成功，下次同步会核对）"
+            elif isinstance(e, Exception) and "ConnectionError" in kind:
+                msg = f"网络连接中断：{e}"
+            return {"error": f"{msg}（{kind}）", "errno": None, "failed": [], "ok_fs_ids": [],
+                    "exception": kind}
         errno = res.get("errno")
-        if errno not in (0, None):
-            return {"error": _share_err(errno, "转存失败")}
-        return {"error": None}
+        show_msg = str(res.get("show_msg") or res.get("err_msg") or "")
+        failed, ok_ids = [], []
+        for it in res.get("info") or []:
+            if not isinstance(it, dict):
+                continue
+            fid = str(it.get("fsid", ""))
+            e_no = it.get("errno")
+            nm = name_of.get(fid) or str(it.get("path", "")).rsplit("/", 1)[-1]
+            if e_no in (0, None):
+                ok_ids.append(fid)
+            else:
+                failed.append({"fs_id": fid, "name": nm, "errno": e_no,
+                               "reason": _share_err(e_no, "转存失败")})
+        if errno in (0, None) and not failed:
+            return {"error": None, "errno": errno, "failed": [], "ok_fs_ids": ok_ids,
+                    "duplicated": bool(res.get("duplicated"))}
+        text = _share_err(errno, "转存失败")
+        if show_msg:
+            text += f"，百度提示：{show_msg}"
+        return {"error": text, "errno": errno, "show_msg": show_msg, "failed": failed,
+                "ok_fs_ids": ok_ids}
 
     def rename_in_dir(self, target_ref: str, old_name: str, new_name: str) -> None:
         """转存后按文件名改名（target_ref 为目录路径）。"""

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QMessageBox,
+    QPlainTextEdit,
 )
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
@@ -74,7 +75,7 @@ class LogsPage(QWidget):
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["时间", "状态", "内容"])
-        setup_table(self.table, row_height=36)
+        setup_table(self.table, row_height=36, selectable=True)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
@@ -83,7 +84,25 @@ class LogsPage(QWidget):
         self.table.setColumnWidth(1, 86)
         root.addWidget(table_frame(self.table), 1)
 
+        # 选中一条记录 → 在这里看完整内容（长的失败原因在表格里会被省略号截掉），可直接选中复制
+        self.detail = QPlainTextEdit()
+        self.detail.setObjectName("Log")
+        self.detail.setReadOnly(True)
+        self.detail.setFixedHeight(96)
+        self.detail.setPlaceholderText("点上面任意一条记录，这里显示完整内容（可选中复制）")
+        root.addWidget(self.detail)
+        self.table.itemSelectionChanged.connect(self._show_detail)
+
         self.reload()
+
+    def _show_detail(self):
+        row = self.table.currentRow()
+        if row < 0:
+            self.detail.clear()
+            return
+        ts = self.table.item(row, 0)
+        msg = self.table.item(row, 2)
+        self.detail.setPlainText((ts.text() if ts else "") + "\n" + (msg.text() if msg else ""))
 
     def on_shown(self):
         self.reload()
@@ -94,6 +113,7 @@ class LogsPage(QWidget):
 
     def reload(self):
         logs = db.list_logs(400, self.level or None, self.search.text().strip())
+        self.detail.clear()
         self.table.setRowCount(0)
         self.table.setRowCount(len(logs))
         for r, lg in enumerate(logs):
